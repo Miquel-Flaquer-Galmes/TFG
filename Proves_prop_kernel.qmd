@@ -40,6 +40,8 @@ G_6 = Graph(adj_6, node_attributes=atr_6)
 Grafs = [G_1, G_2, G_3, G_4, G_5, G_6]
 prop_ker = Propagation(normalize=True, t_max=3) # t_max podria ser el màxim entre n i el diàmetre del graf
 
+# si modific el qmd puc tornar a fer un pull??
+
 Mat_sem = prop_ker_transform(Grafs)
 
 ```
