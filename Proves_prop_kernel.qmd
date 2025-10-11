@@ -9,9 +9,9 @@ editor: visual
 Anem a crear una sèrie de grafs jugueta per poder-los comparar mitjançant el propagation kernel.
 
 ```{python}
-# import grakel
-# from grakel import Graph
-# from grakel.kernels import Propagation
+import grakel
+from grakel import Graph
+from grakel.kernels import Propagation
 
 adj_1 = [[0,1,0,1,0,0],[0,0,1,0,0,0],[0,0,0,0,0,1],[0,0,0,0,0,0],[0,0,0,1,0,1],[0,0,0,0,0,0]]
 atr_1 = {0:[10], 1:[16], 2:[8], 3:[6], 4:[10], 5:[12]}
@@ -40,8 +40,19 @@ G_6 = Graph(adj_6, node_attributes=atr_6)
 Grafs = [G_1, G_2, G_3, G_4, G_5, G_6]
 prop_ker = Propagation(normalize=True, t_max=3) # t_max podria ser el màxim entre n i el diàmetre del graf
 
-# si modific el qmd puc tornar a fer un pull??
+# si modific el qmd puc tornar a fer un pull?
+# a jo m'estan gravant
 
 Mat_sem = prop_ker_transform(Grafs)
+
+```
+
+```{r}
+X=rbinom(101,100,0.5)
+X1=X[-101]
+X2.menos.X1=diff(X)
+plot(X1,X2.menos.X1,pch=20,xlab=expression(X[1]),
+     ylab=expression(X[2]-X[1]))
+#apunts
 
 ```
