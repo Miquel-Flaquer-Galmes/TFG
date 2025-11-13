@@ -6,53 +6,83 @@ editor: visual
 
 ## Grafs
 
-Anem a crear una sèrie de grafs jugueta per poder-los comparar mitjançant el propagation kernel.
+Anem a crear una sèrie de grafs jugueta per poder-los comparar mitjançant el propagation kernel. Ho farem a través de la llibreria igraph. Com aquesta llibreria no té implementats kernels emprarem la llibreria graphkernels per definir el propagationKernel, en primera instància d'una forma molt bàsica, ja que tenim una sola dimensió d'atributs.
 
-```{python}
-import grakel
-from grakel import Graph
-from grakel.kernels import Propagation
 
-adj_1 = [[0,1,0,1,0,0],[0,0,1,0,0,0],[0,0,0,0,0,1],[0,0,0,0,0,0],[0,0,0,1,0,1],[0,0,0,0,0,0]]
-atr_1 = {0:[10], 1:[16], 2:[8], 3:[6], 4:[10], 5:[12]}
-G_1 = Graph(adj_1, node_attributes=atr_1)
-
-adj_2 = [[0,1,0,1,0,0],[0,0,1,0,0,0],[0,0,0,0,0,1],[0,0,0,0,0,0],[0,0,0,1,0,1],[0,0,0,0,0,0]]
-atr_2 = {0:[5], 1:[8], 2:[4], 3:[3], 4:[5], 5:[6]}
-G_2 = Graph(adj_2, node_attributes=atr_2)
-
-adj_3 = [[0,0,0,0,0,0],[1,0,0,0,0,0],[0,1,0,0,0,0],[1,0,0,0,1,0],[0,0,0,0,0,0],[0,0,1,0,1,0]]
-atr_3 = {0:[10], 1:[16], 2:[8], 3:[6], 4:[10], 5:[12]}
-G_3 = Graph(adj_3, node_attributes=atr_3)
-
-adj_4 = [[0,1,0,1,0,0],[0,0,1,0,0,0],[0,0,0,0,0,0],[0,0,0,0,0,0],[0,0,0,1,0,1],[0,0,0,0,0,0]]
-atr_4 = {0:[7], 1:[2], 2:[11], 3:[5], 4:[13], 5:[3]}
-G_4 = Graph(adj_4, node_attributes=atr_4)
-
-adj_5 = [[0,1,1,0,0,0],[0,0,0,0,0,1],[0,0,0,0,1,1],[0,0,1,0,0,0],[0,0,0,1,0,0],[1,0,0,0,1,0]]
-atr_5 = {0:[1], 1:[2], 2:[3], 3:[4], 4:[5], 5:[6]}
-G_5 = Graph(adj_5, node_attributes=atr_5)
-
-adj_6 = [[0,1,0,0,0,1],[0,0,1,0,0,1],[0,0,0,0,1,1],[0,0,1,0,0,0],[0,0,0,1,0,0],[1,0,0,0,1,0]]
-atr_6 = {0:[12], 1:[18], 2:[26], 3:[26], 4:[32], 5:[9]}
-G_6 = Graph(adj_6, node_attributes=atr_6)
-
-Grafs = [G_1, G_2, G_3, G_4, G_5, G_6]
-prop_ker = Propagation(normalize=True, t_max=3) # t_max podria ser el màxim entre n i el diàmetre del graf
-
-# si modific el qmd puc tornar a fer un pull?
-# a jo m'estan gravant
-
-Mat_sem = prop_ker_transform(Grafs)
-
+```{r, echo=FALSE}
+matriu_propagacio <- function(G){
+  T <- as_adjacency_matrix(G, sparse = TRUE)
+  suma_files <- Matrix::rowSums(T)
+  d <- ifelse(suma_files == 0, 1, 0)
+  suma_files[suma_files == 0] <- 1
+  T_prop <- (T / suma_files) + diag(d)
+  return (T_prop)
+}
 ```
 
-```{r}
-X=rbinom(101,100,0.5)
-X1=X[-101]
-X2.menos.X1=diff(X)
-plot(X1,X2.menos.X1,pch=20,xlab=expression(X[1]),
-     ylab=expression(X[2]-X[1]))
-#apunts
+
+
+```{r, echo=FALSE}
+library(graphkernels)
+library(Matrix)
+library(lsa)
+
+Prop_att_ker <- function(G1, G2, iteracions){
+  p1 <- as.matrix(as_tibble(vertex.attributes(G1)))
+  p2 <- as.matrix(as_tibble(vertex.attributes(G2)))
+  MP1 <- t(matriu_propagacio(G1))
+  MP2 <- t(matriu_propagacio(G2))
+  dist_cos <- 1 - cosine(as.vector(p1),as.vector(p2))
+  for (i in 1:iteracions){
+    p1 <- MP1 %*% p1
+    p2 <- MP2 %*% p2
+    dist_cos <- 1 - cosine(as.vector(p1),as.vector(p2))
+  } 
+return(dist_cos)
+}
+  
+```
+
+
+
+```{r, echo=FALSE}
+library(igraph)
+library(tidyverse)
+adj_1 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
+g1 <- graph_from_adjacency_matrix(
+  adj_1, mode = c("directed")
+  ) %>% 
+    set_vertex_attr("pesos", value = c(10,16,8,6,10,12))
+
+
+adj_2 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
+g2 <- graph_from_adjacency_matrix(
+  adj_2, mode = c("directed")
+  ) %>% 
+    set_vertex_attr("pesos", value = c(5,8,4,3,5,6))
+
+adj_3 <- matrix(c(0,0,0,0,0,0, 1,0,0,0,0,0, 0,1,0,0,0,0, 1,0,0,0,1,0, 0,0,0,0,0,0, 0,0,1,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
+g3 <- graph_from_adjacency_matrix(
+  adj_3, mode = c("directed")
+  ) %>% 
+    set_vertex_attr("pesos", value = c(10,16,8,6,10,12))
+
+adj_4 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
+g4 <- graph_from_adjacency_matrix(
+  adj_4, mode = c("directed")
+  ) %>% 
+    set_vertex_attr("pesos", value = c(7,2,11,5,13,3))
+
+adj_5 <- matrix(c(0,1,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,1,1, 0,0,1,0,0,0, 0,0,0,1,0,0, 1,0,0,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
+g5 <- graph_from_adjacency_matrix(
+  adj_5, mode = c("directed")
+  ) %>% 
+    set_vertex_attr("pesos", value = c(1:6))
+
+adj_6 <- matrix(c(0,1,0,0,0,1, 0,0,1,0,0,1, 0,0,0,0,1,1, 0,0,1,0,0,0, 0,0,0,1,0,0, 1,0,0,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
+g6 <- graph_from_adjacency_matrix(
+  adj_6, mode = c("directed")
+  ) %>% 
+    set_vertex_attr("pesos", value = c(12,18,26,26,32,9))
 
 ```
