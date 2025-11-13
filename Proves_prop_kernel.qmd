@@ -45,6 +45,7 @@ return(dist_cos)
 
 
 
+<<<<<<< HEAD
 ```{r, echo=FALSE}
 library(igraph)
 library(tidyverse)
@@ -53,6 +54,10 @@ g1 <- graph_from_adjacency_matrix(
   adj_1, mode = c("directed")
   ) %>% 
     set_vertex_attr("pesos", value = c(10,16,8,6,10,12))
+=======
+# si modific el qmd puc tornar a fer un pull?
+# a jo m'estan gravant
+>>>>>>> 95388f64256827e6dcfec88cdc01974873243043
 
 
 adj_2 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
