@@ -6,8 +6,7 @@ editor: visual
 
 ## Grafs
 
-Anem a crear una sèrie de grafs jugueta per poder-los comparar mitjançant el propagation kernel. Ho farem a través de la llibreria igraph. Com aquesta llibreria no té implementats kernels emprarem la llibreria graphkernels per definir el propagationKernel, en primera instància d'una forma molt bàsica, ja que tenim una sola dimensió d'atributs.
-
+Funció que retorna la matriu de propagació.
 
 ```{r, echo=FALSE}
 matriu_propagacio <- function(G){
@@ -20,6 +19,26 @@ matriu_propagacio <- function(G){
 }
 ```
 
+Funció que retorna els vectors $p^i$.
+
+
+```{r}
+library(igraph)
+
+vector_p <- function(etiquetes_graf, pesos, conjunt_etiquetes){
+  
+  p <- sapply(conjunt_etiquetes, function(e_i){
+    if (e_i %in% etiquetes_graf){
+      pesos[which(etiquetes_graf == e_i)]
+    } else{
+      0
+    }
+  })
+
+  return(p)
+
+}
+```
 
 
 ```{r, echo=FALSE}
@@ -28,66 +47,93 @@ library(Matrix)
 library(lsa)
 
 Prop_att_ker <- function(G1, G2, iteracions){
-  p1 <- as.matrix(as_tibble(vertex.attributes(G1)))
-  p2 <- as.matrix(as_tibble(vertex.attributes(G2)))
+  etiquetes_1 <- V(G1)$etiquetes
+  etiquetes_2 <- V(G2)$etiquetes
+  conjunt_etiquetes <- unique(c(etiquetes_1,etiquetes_2))
+  
+  pesos_1 <- V(G1)$pesos
+  pesos_2 <- V(G2)$pesos
+  
+  p1 <- vector_p(etiquetes_1, pesos_1, conjunt_etiquetes)
+  p2 <- vector_p(etiquetes_2, pesos_2, conjunt_etiquetes)
+  
   MP1 <- t(matriu_propagacio(G1))
   MP2 <- t(matriu_propagacio(G2))
-  dist_cos <- 1 - cosine(as.vector(p1),as.vector(p2))
-  for (i in 1:iteracions){
-    p1 <- MP1 %*% p1
-    p2 <- MP2 %*% p2
-    dist_cos <- 1 - cosine(as.vector(p1),as.vector(p2))
-  } 
-return(dist_cos)
+  
+  sim = 1 - cosine(p1,p2)
+  
+  if (iteracions > 1){
+    for (i in 1:iteracions){
+    pesos_1 <- MP1 %*% pesos_1
+    pesos_2 <- MP2 %*% pesos_2
+    
+    p1 <- vector_p(etiquetes_1, pesos_1, conjunt_etiquetes)
+    p2 <- vector_p(etiquetes_2, pesos_2, conjunt_etiquetes)
+    
+    sim <- sim + 1 - cosine(p1,p2)
+    } 
+  }
+  
+return(sim)
 }
   
 ```
 
 
-
-<<<<<<< HEAD
 ```{r, echo=FALSE}
 library(igraph)
 library(tidyverse)
+
+
 adj_1 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
 g1 <- graph_from_adjacency_matrix(
   adj_1, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(10,16,8,6,10,12))
-=======
-# si modific el qmd puc tornar a fer un pull?
-# a jo m'estan gravant
->>>>>>> 95388f64256827e6dcfec88cdc01974873243043
-
+    set_vertex_attr("pesos", value = c(10,16,8,6,10,12)) %>% 
+    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
 
 adj_2 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
 g2 <- graph_from_adjacency_matrix(
   adj_2, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(5,8,4,3,5,6))
+    set_vertex_attr("pesos", value = c(5,8,4,3,5,6)) %>% 
+    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
 
 adj_3 <- matrix(c(0,0,0,0,0,0, 1,0,0,0,0,0, 0,1,0,0,0,0, 1,0,0,0,1,0, 0,0,0,0,0,0, 0,0,1,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
 g3 <- graph_from_adjacency_matrix(
   adj_3, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(10,16,8,6,10,12))
+    set_vertex_attr("pesos", value = c(10,16,8,6,10,12))%>% 
+    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
 
 adj_4 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
 g4 <- graph_from_adjacency_matrix(
   adj_4, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(7,2,11,5,13,3))
+    set_vertex_attr("pesos", value = c(7,2,11,5,13,3)) %>% 
+    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
 
 adj_5 <- matrix(c(0,1,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,1,1, 0,0,1,0,0,0, 0,0,0,1,0,0, 1,0,0,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
 g5 <- graph_from_adjacency_matrix(
   adj_5, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(1:6))
+    set_vertex_attr("pesos", value = c(1:6)) %>% 
+    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
 
 adj_6 <- matrix(c(0,1,0,0,0,1, 0,0,1,0,0,1, 0,0,0,0,1,1, 0,0,1,0,0,0, 0,0,0,1,0,0, 1,0,0,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
 g6 <- graph_from_adjacency_matrix(
   adj_6, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(12,18,26,26,32,9))
+    set_vertex_attr("pesos", value = c(12,18,26,26,32,9)) %>% 
+    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
 
+llista <- list(g1,g2,g3,g4,g5,g6)  
+M <- matrix(0, 6, 6)
+  
+  for (i in 1:6) {
+    for (j in 1:6) {
+      M[i, j] <- Prop_att_ker(llista[[i]], llista[[j]], 3)
+    }
+  }
 ```
+
