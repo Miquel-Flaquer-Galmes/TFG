@@ -60,7 +60,7 @@ Prop_att_ker <- function(G1, G2, iteracions){
   MP1 <- t(matriu_propagacio(G1))
   MP2 <- t(matriu_propagacio(G2))
   
-  sim = 1 - cosine(p1,p2)
+  sim = cosine(p1,p2)
   
   if (iteracions > 1){
     for (i in 1:iteracions){
@@ -70,7 +70,7 @@ Prop_att_ker <- function(G1, G2, iteracions){
     p1 <- vector_p(etiquetes_1, pesos_1, conjunt_etiquetes)
     p2 <- vector_p(etiquetes_2, pesos_2, conjunt_etiquetes)
     
-    sim <- sim + 1 - cosine(p1,p2)
+    sim <- sim + cosine(p1,p2)
     } 
   }
   
