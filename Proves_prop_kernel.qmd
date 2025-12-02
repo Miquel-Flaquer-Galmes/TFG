@@ -15,42 +15,39 @@ matriu_propagacio <- function(G){
   d <- ifelse(suma_files == 0, 1, 0)
   suma_files[suma_files == 0] <- 1
   T_prop <- (T / suma_files) + diag(d)
-  return (T_prop)
+  return (t(T_prop))
 }
 ```
 
-Funció que retorna els vectors $p^i$.
+Funció que retorna els vectors $p_i$. És una funció auxiliar no l'utilitz. 
 
 ```{r}
 library(igraph)
 
 vector_p <- function(etiquetes_graf, pesos, conjunt_etiquetes){
   
-  p <- sapply(conjunt_etiquetes, function(e_i){
-    if (e_i %in% etiquetes_graf){
-      pesos[which(etiquetes_graf == e_i)]
-    } else{
-      0
-    }
-  })
-
+  p <- numeric(length(conjunt_etiquetes))
+  idx <- match(etiquetes_graf, conjunt_etiquetes)
+  p[idx] <- pesos
   return(p)
 
 }
 ```
+
+Funció per fer proves de manera aleatòria. És molt probable que hi hagui etiquetes repetides, ens interessa.
 
 ```{r}
 library(igraph)
 
 generar_graf_aleatori <- function(n_min,n_max,a_min,a_max){
   
-  num_nodes <- sample(n_min:n_max, 1)
-num_arestes <- sample(a_min:a_max, 1)
+num_nodes <- sample(n_min:n_max, 1)
+num_arestes <- min(sample(a_min:a_max, 1), num_nodes*(num_nodes - 1))
 
 g <- sample_gnm(n = num_nodes,
-                      m = num_arestes,
-                      directed = TRUE,
-                      loops = FALSE)
+                    m = num_arestes,
+                    directed = TRUE,
+                    loops = FALSE)
 
 
 V(g)$pesos <- sample(1:1000, num_nodes, replace = TRUE)
@@ -73,7 +70,6 @@ maj_comp_con <- function(g, mode = "weak") {
 ```
 
 ```{r, echo=FALSE}
-library(graphkernels)
 library(Matrix)
 library(lsa)
 
@@ -92,24 +88,29 @@ Prop_att_ker <- function(G1, G2,iteracions){
   etiquetes_2 <- V(G2)$etiquetes
   conjunt_etiquetes <- unique(c(etiquetes_1,etiquetes_2))
   
-  pesos_1 <- V(G1)$pesos
-  pesos_2 <- V(G2)$pesos
+  pesos_1 <- as.numeric(V(G1)$pesos)
+  pesos_2 <- as.numeric(V(G2)$pesos)
   
-  p1 <- vector_p(etiquetes_1, pesos_1, conjunt_etiquetes)
-  p2 <- vector_p(etiquetes_2, pesos_2, conjunt_etiquetes)
+  idx1 <- match(etiquetes_1, conjunt_etiquetes)
+  idx2 <- match(etiquetes_2, conjunt_etiquetes)
   
-  MP1 <- t(matriu_propagacio(G1))
-  MP2 <- t(matriu_propagacio(G2))
+  p1 <- numeric(length(conjunt_etiquetes))
+  p2 <- numeric(length(conjunt_etiquetes))
+  p1[idx1] <- pesos_1
+  p2[idx2] <- pesos_2
+  
+  MP1 <- matriu_propagacio(G1)
+  MP2 <- matriu_propagacio(G2)
   
   sim = cosine(p1,p2)
   
   if (iteracions > 1){
-    for (i in 1:iteracions){
+    for (i in 2:iteracions){
     pesos_1 <- MP1 %*% pesos_1
     pesos_2 <- MP2 %*% pesos_2
     
-    p1 <- vector_p(etiquetes_1, pesos_1, conjunt_etiquetes)
-    p2 <- vector_p(etiquetes_2, pesos_2, conjunt_etiquetes)
+    p1[idx1] <- pesos_1
+    p2[idx2] <- pesos_2
     
     sim <- sim + cosine(p1,p2)
     } 
@@ -181,10 +182,10 @@ M <- matrix(0, 6, 6)
 library(igraph)
 
 
-g1 <- generar_graf_aleatori(12000,13000,400000,500000)
-g2 <- generar_graf_aleatori(14300,15400,500000,550000)
+g1 <- generar_graf_aleatori(100,101,20000,20500)
+g2 <- generar_graf_aleatori(100,101,4000,4200)
 
-a <- Prop_att_ker(g1,g2, 3)
+a <- Prop_att_ker(g1,g2, iteracions = 3)
 
 ```
 
