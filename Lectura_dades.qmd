@@ -3,6 +3,7 @@ title: "Proves_llegir_dades"
 format: html
 editor: visual
 ---
+
 ```{r}
 library(tidyverse)
 library(jsonlite)
@@ -29,7 +30,7 @@ suppressPackageStartupMessages({
 })
 
 ## ── 0. CONFIGURATION ─────────────────────────────────────────
-ABUND_FILE   <- "data/Taula_abundàncies_KOs.tsv" # definim la ruta de la taula d'abundàncies
+ABUND_FILE   <- "MTG_abund.tsv" # definim la ruta de la taula d'abundàncies
 KO_EC_FILE   <- "Dades_Pere/enzymes_KO.json" # definim la ruta que relaciona K00 i enzims
 EC_RXN_FILE  <- "Dades_Pere/enzymes_lite.json" # definim la ruta que relaciona reaccions i enzims
 RXN_FILE     <- "Dades_Pere/reactions_lite_pw.json" # definim la ruta que ens dona reaccions reversibles
@@ -53,7 +54,7 @@ message("Building KO → reactions mapping...")
 ec_to_rxns <- lapply(ec_rxn_raw, function(ec_entry) {
   unique(unlist(ec_entry[["reaction"]]))  # field name per your JSON structure
 })
-names(ec_to_rxns) <- sapply(ec_rxn_raw, `[[`, "ec_number")  # adjust key if needed
+names(ec_to_rxns) <- sapply(ec_rxn_raw, `[[`, "enzyme")  # adjust key if needed
 
 # KO → unique reaction IDs  (via EC intermediary)
 ko_to_rxns <- lapply(ko_ec_raw, function(ec_list) {
@@ -69,7 +70,7 @@ ko_to_rxns <- Filter(function(x) length(x) > 0, ko_to_rxns)
 message("Building reaction metadata...")
 
 rxn_meta <- tibble(
-  rxn_id     = sapply(rxn_raw, `[[`, "id"),           # adjust key as needed
+  rxn_id     = sapply(rxn_raw, `[[`, "reaction"),           # adjust key as needed
   reversible = sapply(rxn_raw, function(r) isTRUE(r[["reversible"]])),
   substrates = lapply(rxn_raw, function(r) unique(unlist(r[["substrate"]]))),
   products   = lapply(rxn_raw, function(r) unique(unlist(r[["product"]])))
@@ -215,4 +216,3 @@ summary_df <- tibble(
 print(summary_df)
 write.csv(summary_df, file.path(OUT_DIR, "graph_summary.csv"), row.names = FALSE)
 ```
-

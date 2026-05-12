@@ -8,18 +8,32 @@ editor: visual
 
 Funció que retorna la matriu de propagació.
 
-```{r, echo=FALSE}
+
+```{r}
+library(Matrix) 
+
 matriu_propagacio <- function(G){
+  
+
   T <- as_adjacency_matrix(G, sparse = TRUE)
+  
+
   suma_files <- Matrix::rowSums(T)
   d <- ifelse(suma_files == 0, 1, 0)
+  d
   suma_files[suma_files == 0] <- 1
-  T_prop <- (T / suma_files) + diag(d)
-  return (t(T_prop))
+  suma_files
+  D_inv <- Matrix::Diagonal(x = 1/suma_files)
+  D_d   <- Matrix::Diagonal(x = d)
+  
+  T_prop <- (D_inv %*% T) + D_d
+  
+
+  return(t(T_prop))
 }
 ```
 
-Funció que retorna els vectors $p_i$. És una funció auxiliar no l'utilitz. 
+Funció que retorna els vectors $p_i$. És una funció auxiliar no l'utilitz.
 
 ```{r}
 library(igraph)
@@ -50,12 +64,11 @@ g <- sample_gnm(n = num_nodes,
                     loops = FALSE)
 
 
-V(g)$pesos <- sample(1:1000, num_nodes, replace = TRUE)
-V(g)$etiquetes <- paste0("node_", 1:num_nodes)
+V(g)$abundance <- sample(1:1000, num_nodes, replace = TRUE)
+V(g)$name <- paste0("node_", 1:num_nodes)
 return(g)
 }
 ```
-
 
 ```{r, echo=FALSE}
 library(igraph)
@@ -84,12 +97,12 @@ Prop_att_ker <- function(G1, G2,iteracions){
   }
    
   
-  etiquetes_1 <- V(G1)$etiquetes
-  etiquetes_2 <- V(G2)$etiquetes
+  etiquetes_1 <- V(G1)$name
+  etiquetes_2 <- V(G2)$name
   conjunt_etiquetes <- unique(c(etiquetes_1,etiquetes_2))
   
-  pesos_1 <- as.numeric(V(G1)$pesos)
-  pesos_2 <- as.numeric(V(G2)$pesos)
+  pesos_1 <- as.numeric(V(G1)$abundance)
+  pesos_2 <- as.numeric(V(G2)$abundance)
   
   idx1 <- match(etiquetes_1, conjunt_etiquetes)
   idx2 <- match(etiquetes_2, conjunt_etiquetes)
@@ -130,43 +143,43 @@ adj_1 <- matrix(c(0,1,0,1,0,0,0,0, 0,0,1,0,0,0,0,0, 0,0,0,0,0,1,0,0, 0,0,0,0,0,0
 g1 <- graph_from_adjacency_matrix(
   adj_1, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(10,16,8,6,10,12,10,10)) %>% 
-    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F","p","q"))
+    set_vertex_attr("abundance", value = c(10,16,8,6,10,12,10,10)) %>% 
+    set_vertex_attr("name", value = c("A","B","C","D","E","F","p","q"))
 
 adj_2 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
 g2 <- graph_from_adjacency_matrix(
   adj_2, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(5,8,4,3,5,6)) %>% 
-    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
+    set_vertex_attr("abundance", value = c(5,8,4,3,5,6)) %>% 
+    set_vertex_attr("name", value = c("A","B","C","D","E","F"))
 
 adj_3 <- matrix(c(0,0,0,0,0,0, 1,0,0,0,0,0, 0,1,0,0,0,0, 1,0,0,0,1,0, 0,0,0,0,0,0, 0,0,1,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
 g3 <- graph_from_adjacency_matrix(
   adj_3, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(10,16,8,6,10,12))%>% 
-    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
+    set_vertex_attr("abundance", value = c(10,16,8,6,10,12))%>% 
+    set_vertex_attr("name", value = c("A","B","C","D","E","F"))
 
 adj_4 <- matrix(c(0,1,0,1,0,0, 0,0,1,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,1,0,1, 0,0,0,0,0,0), nrow = 6, ncol = 6, byrow = TRUE)
 g4 <- graph_from_adjacency_matrix(
   adj_4, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(7,2,11,5,13,3)) %>% 
-    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
+    set_vertex_attr("abundance", value = c(7,2,11,5,13,3)) %>% 
+    set_vertex_attr("name", value = c("A","B","C","D","E","F"))
 
 adj_5 <- matrix(c(0,1,1,0,0,0, 0,0,0,0,0,1, 0,0,0,0,1,1, 0,0,1,0,0,0, 0,0,0,1,0,0, 1,0,0,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
 g5 <- graph_from_adjacency_matrix(
   adj_5, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(1:6)) %>% 
-    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
+    set_vertex_attr("abundance", value = c(1:6)) %>% 
+    set_vertex_attr("name", value = c("A","B","C","D","E","F"))
 
 adj_6 <- matrix(c(0,1,0,0,0,1, 0,0,1,0,0,1, 0,0,0,0,1,1, 0,0,1,0,0,0, 0,0,0,1,0,0, 1,0,0,0,1,0), nrow = 6, ncol = 6, byrow = TRUE)
 g6 <- graph_from_adjacency_matrix(
   adj_6, mode = c("directed")
   ) %>% 
-    set_vertex_attr("pesos", value = c(12,18,26,26,32,9)) %>% 
-    set_vertex_attr("etiquetes", value = c("A","B","C","D","E","F"))
+    set_vertex_attr("abundance", value = c(12,18,26,26,32,9)) %>% 
+    set_vertex_attr("name", value = c("A","B","C","D","E","F"))
 
 llista <- list(g1,g2,g3,g4,g5,g6)  
 M <- matrix(0, 6, 6)
@@ -193,16 +206,27 @@ a <- Prop_att_ker(g1,g2, iteracions = 3)
 library(igraph)
 
 
-llista_grafs <- lapply(1:100, function(i) generar_graf_aleatori(130,150,600,700))
+llista_grafs <- graphs
 
-n <- length(llista_grafs)  # 100
-M <- matrix(0, n, n)       # Matriu de 100 x 100
+n <- length(llista_grafs) 
+M <- matrix(0, n, n)       
 
 for (i in 1:n) {
-  for (j in 1:n) {
-    M[i, j] <- Prop_att_ker(llista_grafs[[i]], llista_grafs[[j]], iteracions = FALSE)
+  for (j in i:n) {
+    val <- Prop_att_ker(llista_grafs[[i]], llista_grafs[[j]], iteracions = FALSE)
+    
+    M[i,j] <- val
+    M[j,i] <- val
   }
 }
 
+arrels_diag <- sqrt(diag(M))
+
+denominadors <- outer(arrels_diag, arrels_diag, FUN = "*")
+
+M_sim <- M / denominadors
+
 ```
+
+
 
