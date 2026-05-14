@@ -44,14 +44,14 @@ fit_gamma_expected <- function(x_all) {
 
   if (n_pos == 0) # si tots són nuls retornar 0
     return(list(mean_est = 0,
-                shape = -1, # demanar si té sentit posar 0's
-                rate = -1, # demanar si té sentit posar 0's
+                shape = NA, # demanar si té sentit posar 0's
+                rate = NA, # demanar si té sentit posar 0's
                 method = "zero",   prop_positive = 0))
 
   if (n_pos < 2) # si tenim una única dada
     return(list(mean_est = prop_pos * x_pos[1],
-                shape = -1, # demanar si té sentit posar 1
-                rate = -1, # demanar si té sentit posar 1 / x_pos[1]
+                shape = NA, # demanar si té sentit posar 1
+                rate = NA, # demanar si té sentit posar 1 / x_pos[1]
                 method = "mean_only", prop_positive = prop_pos))
 
   # Provam amb el mètode MLE (màxima versemblança), si no va bé provam per MME (mètode dels moments)
@@ -122,11 +122,13 @@ saveRDS(ko_expected, file.path(OUT_DIR, "ko_expected.rds")) # guardam el vector 
 # Abundància de la reacció: distribució proporcional de l'abundància del K00
 # entre totes les reaccions que activa.
 
-ko_ec_raw <- fromJSON(PATH_KO_EC,  simplifyVector = FALSE) # de K0 a enzims
+ko_ec_raw <- fromJSON(PATH_KO_EC,  simplifyVector = FALSE) # una taula que donat un K00 té associat una llista amb els enzims
 
-ec_rxn_raw <- fromJSON(PATH_EC_RXN, simplifyVector = FALSE) # d'enzims a reaccions
+ec_rxn_raw <- fromJSON(PATH_EC_RXN, simplifyVector = FALSE) # una taula que donat un enzim
+names(ec_rxn_raw) <- vapply(ec_rxn_raw, function(x) x$enzyme, character(1))
 
 rxn_raw <- fromJSON(PATH_RXN,    simplifyVector = FALSE)  # informació de reaccions
+names(rxn_raw) <- vapply(rxn_raw, function(x) x$reaction, character(1))
 
 
 ec_to_rxns  <- lapply(ec_rxn_raw, \(e) unique(unlist(e[["reaction"]])))
@@ -152,12 +154,16 @@ rxn_meta <- tibble(
   products   = lapply(rxn_raw, \(r) unique(unlist(r[["product"]])))
 )
 
+# taula que guarda el nom de la reacció si és reversible o no i quins són els seus productes i substrats
+
+
 # ── 2d. Funció de construcció del graf (origen: Lectura_dades.qmd) ────────────
 build_cohort_graph <- function(abund_vec, ko_to_rxns, rxn_meta,
                                label = "cohort") {
 
   # Filtra K00's actius (abundància > 0) amb mapeig conegut
-  active_kos <- intersect(names(abund_vec[abund_vec > 1e-9]), names(ko_to_rxns))
+  active_kos <- intersect(names(abund_vec[abund_vec > 0]), names(ko_to_rxns)) # interseca el conjunt de K0's que tenen abundància positiva amb el conjunt de K0's que sabem a quina reacció estan associats.
+  
   cat(sprintf("    K00's actius amb mapeig: %d\n", length(active_kos)))
 
   if (length(active_kos) == 0) stop("Cap K00 actiu trobat.")
@@ -165,32 +171,44 @@ build_cohort_graph <- function(abund_vec, ko_to_rxns, rxn_meta,
   # Abundància proporcional per reacció:
   # cada K00 reparteix la seva abundància equitativament entre les seves reaccions
   rxn_abund_long <- lapply(active_kos, function(ko) {
-    rxns <- ko_to_rxns[[ko]]
-    tibble(rxn_id    = rxns,
-           frac_abund = abund_vec[[ko]] / length(rxns))
+    rxns <- ko_to_rxns[[ko]] # reaccions associades al K0 concret
+    tibble(rxn_id    = rxns,  
+           frac_abund = abund_vec[[ko]] / length(rxns))  # una taula amb dues columnes, la primera té el nom de les reaccions associades al K0 concret i la segona reperteix l'abundància d'el K0 amb 'aquest de forma equivalent entre totes les reaccions que tenim assocides (rxns)
   }) |>
     bind_rows() |>
-    summarise(abundance = sum(frac_abund), .by = rxn_id)
+    summarise(abundance = sum(frac_abund), .by = rxn_id)  # com que diferents K0's poden catalitzar la mateixa reacció a la taula anterior podem tenir reaccions repetides amb diferents abundàncies. Per això sumam totes les abundàncies de cada reacció. Obtenint una taula on la primera columna té totes les reaccions actives i la segona la suma de les abundàncies
 
   active_rxns <- rxn_abund_long |>
-    filter(abundance > 1e-9) |>
-    inner_join(rxn_meta, by = "rxn_id")
+    filter(abundance > 0) |>
+    inner_join(rxn_meta, by = "rxn_id") # afegim les dades de quins substrats, productes i la reversibilitat de les reaccions
 
   cat(sprintf("    Reaccions actives: %d\n", nrow(active_rxns)))
+  
+  rev_rxns <- active_rxns |>
+    filter(reversible) |>
+    mutate(
+      new_rxn_id    = paste0(rxn_id, "_rev"),
+      new_substrates = products,
+      new_products   = substrates
+    ) |>
+    transmute(
+      rxn_id     = new_rxn_id,
+      abundance  = abundance,
+      reversible = TRUE,
+      substrates = new_substrates,
+      products   = new_products
+    )
+  
+  active_rxns <- active_rxns |>
+  bind_rows(rev_rxns)
 
   # ── Indexació vectoritzada per trobar arestes ────────────────────────────────
   # produced(A) = productes(A) ∪ substrats(A) si reversible
   # consumed(A) = substrats(A) ∪ productes(A) si reversible
-  produced <- mapply(
-    function(prod, subs, rev) if (rev) union(prod, subs) else prod,
-    active_rxns$products, active_rxns$substrates, active_rxns$reversible,
-    SIMPLIFY = FALSE
-  )
-  consumed <- mapply(
-    function(subs, prod, rev) if (rev) union(subs, prod) else subs,
-    active_rxns$substrates, active_rxns$products, active_rxns$reversible,
-    SIMPLIFY = FALSE
-  )
+  
+  produced <- active_rxns$products
+  consumed <- active_rxns$substrates
+
 
   # Índex invers: compost → índexs de les reaccions que el consumeixen
   all_consumed_cpds   <- unique(unlist(consumed))
