@@ -1,6 +1,6 @@
 # Grafs metabòlics i cadenes de Markov a partir d'abundàncies de KOs
 
-Codi i dades del Treball de Fi de Grau. El projecte construeix **grafs dirigits de reaccions metabòliques** a partir de matrius d'abundància d'ortòlegs KEGG (KOs), els analitza com a **cadenes de Markov** i en compara l'estructura entre mostres mitjançant un **kernel de propagació/transició**, resumit en dendrogrames i heatmaps.
+El projecte construeix **grafs dirigits de reaccions metabòliques** a partir de matrius d'abundància d'ortòlegs KEGG (KOs), els analitza com a **cadenes de Markov** i en compara l'estructura entre mostres mitjançant un **kernel de propagació/transició**, resumit en dendrogrames i heatmaps.
 
 L'anàlisi s'aplica a tres cohorts independents:
 
