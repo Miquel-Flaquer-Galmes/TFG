@@ -1,0 +1,767 @@
+---
+title: "Cadena de Markov metabòlica — flux unificat"
+format: html
+editor: visual
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(igraph)
+  library(Matrix)
+  library(jsonlite)
+  library(fitdistrplus)
+  library(markovchain)
+  library(goftest)
+})
+
+# ── RUTES DE FITXERS ──────────────────────────────────────────────────────────
+# Ajusta aquests paths al teu entorn local
+PATH_ABUNDANCES <- "Mostres/MTG_abund.tsv"
+PATH_KO_EC      <- "Dades_Pere/enzymes_KO.json"
+PATH_EC_RXN     <- "Dades_Pere/enzymes_lite_new.json"
+PATH_RXN        <- "Dades_Pere/reactions_lite_pw.json"
+OUT_DIR         <- "output_markov"
+dir.create(OUT_DIR, showWarnings = FALSE)
+```
+
+# BLOC 1 — Estimació estadística de l'esperança de cada KO
+
+Per a cada KO estimam l'esperança $\theta = \mathbb{E}[X]$ de la seva abundància. Si la mostra conté zeros modelam $X$ amb una **Zero-Inflated Gamma** (ZIG), $X = B\cdot G$ amb $B\sim\text{Bernoulli}(p)$, $G\sim\text{Gamma}(\alpha,\beta)$ i $B\perp G$, de manera que $\theta = p\,\alpha/\beta$. Si no conté cap zero, $X\sim\text{Gamma}(\alpha,\beta)$ i $\theta=\alpha/\beta$ (equival a $p=1$).
+
+La variància de $\hat\theta$ i el seu interval de confiança al 95% s'obtenen pel **mètode Delta**. La bondat d'ajust de la part positiva es contrasta amb un test de **Anderson-Darling** sobre les observacions estrictament positives.
+
+```{r bloc1-funcions}
+# ── Estimació ZIG per MLE + mètode Delta ──────────────────────────────────────
+# Optimitzam sobre paràmetres transformats eta ∈ R^3 (sense restriccions):
+#   p = plogis(eta1) ∈ (0,1),  alpha = exp(eta2) > 0,  beta = exp(eta3) > 0
+# Convenció: p ≡ P(X > 0) (probabilitat de la component positiva).
+# Covariància asimptòtica: inversa de la Hessiana observada (informació de Fisher).
+# Mètode Delta (dues passes):
+#   1) de eta a (p, alpha, beta) via Jacobià diagonal J
+#   2) de (p, alpha, beta) a theta = p*alpha/beta via el gradient de theta
+zigamma_mle <- function(y) {
+  n0 <- sum(y == 0)       # nombre de zeros
+  yp <- y[y > 0]          # observacions positives
+
+  negloglik <- function(par) {
+    p     <- plogis(par[1])   # P(X > 0)
+    alpha <- exp(par[2])
+    beta  <- exp(par[3])
+    ll <- n0 * log(1 - p) +                                 # zeros    → 1 - P(X>0)
+          length(yp) * log(p) +                             # positius → P(X>0)
+          sum(dgamma(yp, shape = alpha, rate = beta, log = TRUE))
+    -ll
+  }
+
+  # Inicialització: p per la proporció de positius; (alpha, beta) pel mètode dels moments
+  p.ini     <- mean(y > 0)
+  m         <- mean(yp)
+  v         <- var(yp)
+  alpha.ini <- m^2 / v
+  beta.ini  <- m / v
+
+  fit <- optim(
+    par     = c(qlogis(p.ini), log(alpha.ini), log(beta.ini)),
+    fn      = negloglik,
+    method  = "BFGS",
+    hessian = TRUE
+  )
+
+  eta   <- fit$par
+  p     <- plogis(eta[1])
+  alpha <- exp(eta[2])
+  beta  <- exp(eta[3])
+
+  # Covariància de (p, alpha, beta): Delta amb Jacobià diagonal de les transformacions
+  Veta  <- solve(fit$hessian)
+  J     <- diag(c(p * (1 - p), alpha, beta))
+  Sigma <- J %*% Veta %*% J
+
+  # Esperança i variància de theta = p*alpha/beta: Delta amb el gradient de theta
+  theta     <- p * alpha / beta
+  grad      <- c(alpha / beta, p / beta, -p * alpha / beta^2)
+  var_theta <- drop(t(grad) %*% Sigma %*% grad)
+  se_theta  <- sqrt(var_theta)
+  ci        <- theta + c(-1, 1) * qnorm(0.975) * se_theta
+
+  list(p = p, alpha = alpha, beta = beta,
+       theta = theta, var_theta = var_theta,
+       ci_lower = ci[1], ci_upper = ci[2])
+}
+
+# ── Test de Anderson-Darling de la part positiva contra Gamma(alpha, beta) ───
+# H0: les observacions positives segueixen la Gamma estimada.
+# Retornam el p-valor; NA si no es pot calcular (paràmetres no vàlids o < 2 punts).
+ad_gamma_pvalue <- function(x_pos, alpha, beta) {
+  if (length(x_pos) < 2 || is.na(alpha) || is.na(beta) ||
+      alpha <= 0 || beta <= 0) return(NA_real_)
+  out <- tryCatch(
+    suppressWarnings(goftest::ad.test(x_pos, "pgamma", shape = alpha, rate = beta)),
+    error = \(e) NULL
+  )
+  if (is.null(out)) NA_real_ else unname(out$p.value)
+}
+
+# ── Estimador principal per KO ────────────────────────────────────────────────
+# Retorna sempre la mateixa estructura de camps (facilita construir el data frame).
+#   esperanca   : theta estimada
+#   p_hat       : proporció estimada de positius (1 si no hi ha zeros)
+#   alpha_hat, beta_hat : paràmetres de la Gamma
+#   IC_inferior, IC_superior : interval de confiança 95% de theta (mètode Delta)
+#   p_valor     : p-valor del test AD sobre la part positiva
+#   var_theta   : variància de theta (mètode Delta)
+#   method      : etiqueta del cas triat
+fit_ko_expected <- function(x_all) {
+  n_total  <- length(x_all)
+  x_pos    <- x_all[x_all > 0]
+  n_pos    <- length(x_pos)
+  prop_pos <- n_pos / n_total
+
+  out <- function(esperanca, p_hat, alpha_hat, beta_hat,
+                  IC_inferior = NA_real_, IC_superior = NA_real_,
+                  p_valor = NA_real_, var_theta = NA_real_, method)
+    list(esperanca = esperanca, p_hat = p_hat,
+         alpha_hat = alpha_hat, beta_hat = beta_hat,
+         IC_inferior = IC_inferior, IC_superior = IC_superior,
+         p_valor = p_valor, var_theta = var_theta,
+         prop_positive = prop_pos, method = method)
+
+  # Cas 1: tots nuls → esperança 0
+  if (n_pos == 0)
+    return(out(0, 0, NA_real_, NA_real_, method = "zero"))
+
+  # Cas 2: massa pocs positius per ajustar dos paràmetres
+  if (n_pos < 2)
+    return(out(prop_pos * x_pos[1], prop_pos, NA_real_, NA_real_,
+               method = "mean_only"))
+
+  # Cas 3: hi ha zeros I positius → Zero-Inflated Gamma (MLE + Delta)
+  if (prop_pos < 1) {
+    zig <- tryCatch(zigamma_mle(x_all), error = \(e) NULL)
+    if (!is.null(zig) && is.finite(zig$var_theta) && zig$var_theta >= 0) {
+      pval <- ad_gamma_pvalue(x_pos, zig$alpha, zig$beta)
+      return(out(zig$theta, zig$p, zig$alpha, zig$beta,
+                 zig$ci_lower, zig$ci_upper, pval, zig$var_theta,
+                 method = "zero_inflated_gamma"))
+    }
+    return(out(prop_pos * mean(x_pos), prop_pos, -1, -1,
+               method = "mean_fallback"))
+  }
+
+  # Cas 4: cap zero (prop_pos == 1) → Gamma pura, IC de theta = alpha/beta per Delta
+  fit <- tryCatch(suppressWarnings(fitdist(x_pos, "gamma", method = "mle")),
+                  error = \(e) NULL)
+  if (is.null(fit))
+    fit <- tryCatch(suppressWarnings(fitdist(x_pos, "gamma", method = "mme")),
+                    error = \(e) NULL)
+  if (is.null(fit))
+    return(out(mean(x_pos), 1, -1, -1, method = "mean_fallback"))
+
+  alpha <- unname(fit$estimate["shape"])
+  beta  <- unname(fit$estimate["rate"])
+  theta <- alpha / beta
+
+  var_theta <- NA_real_; ci_l <- NA_real_; ci_u <- NA_real_
+  V <- tryCatch(fit$vcov, error = \(e) NULL)
+  if (!is.null(V) && all(is.finite(V))) {
+    grad      <- c(1 / beta, -alpha / beta^2)   # ∂(alpha/beta)/∂(alpha,beta)
+    var_theta <- drop(t(grad) %*% V %*% grad)
+    if (is.finite(var_theta) && var_theta >= 0) {
+      se   <- sqrt(var_theta)
+      ci_l <- theta - qnorm(0.975) * se
+      ci_u <- theta + qnorm(0.975) * se
+    }
+  }
+  pval <- ad_gamma_pvalue(x_pos, alpha, beta)
+  out(theta, 1, alpha, beta, ci_l, ci_u, pval, var_theta, method = "gamma_mle")
+}
+```
+
+```{r bloc1-execucio}
+# ── Càrrega i filtre de prevalença (KO presents a > 25% de les mostres) ───────
+abund_raw <- read.delim(PATH_ABUNDANCES, row.names = 1, check.names = FALSE)
+
+proporcio <- rowMeans(abund_raw > 0)             # proporció d'entrades positives per KO
+abund_raw <- abund_raw[proporcio > 0.25, , drop = FALSE]
+
+cat(sprintf(">> [1/4] KO's després del filtre de prevalença (>25%%): %d\n",
+            nrow(abund_raw)))
+
+# ── Estimació per a cada KO ───────────────────────────────────────────────────
+gamma_results <- map(rownames(abund_raw), function(ko) {
+  res    <- fit_ko_expected(as.numeric(abund_raw[ko, ]))
+  res$ko <- ko
+  res
+})
+names(gamma_results) <- rownames(abund_raw)
+
+# ── Taula final amb l'esquema de columnes demanat ─────────────────────────────
+gamma_df <- map_dfr(gamma_results, \(x) tibble(
+  ko          = x$ko,
+  esperanca   = x$esperanca,
+  p_hat       = x$p_hat,
+  alpha_hat   = x$alpha_hat,
+  beta_hat    = x$beta_hat,
+  IC_inferior = x$IC_inferior,
+  IC_superior = x$IC_superior,
+  p_valor     = x$p_valor,
+  var_theta   = x$var_theta,
+  method      = x$method
+))
+
+cat("    Resum de mètodes d'estimació:\n")
+print(table(gamma_df$method))
+cat(sprintf("    KO's amb esperança > 0: %d / %d\n",
+            sum(gamma_df$esperanca > 0), nrow(gamma_df)))
+# ── Bondat d'ajust amb control de la taxa d'error per família ─────────────────
+# Contrastam 'n_tests' hipòtesis simultàniament (una per KO). Aplicam Bonferroni:
+# rebutjam H0 per al KO k només si p_k < gamma / n_tests.
+con   <- 0.05
+n_tests <- sum(!is.na(gamma_df$p_valor))
+llindar <- con / n_tests
+
+gamma_df$rebutja_bonferroni <- !is.na(gamma_df$p_valor) & gamma_df$p_valor < llindar
+
+cat(sprintf("    Contrastos de bondat d'ajust realitzats: %d\n", n_tests))
+cat(sprintf("    Llindar de Bonferroni (gamma = %.2f): %.3e\n", con, llindar))
+cat(sprintf("    · Rebuigs SENSE correcció (p < %.2f): %d (%.1f%%)\n",
+            con, sum(gamma_df$p_valor < con, na.rm = TRUE),
+            100 * mean(gamma_df$p_valor < con, na.rm = TRUE)))
+cat(sprintf("    · Rebuigs AMB Bonferroni:            %d (%.2f%%)\n",
+            sum(gamma_df$rebutja_bonferroni),
+            100 * mean(gamma_df$rebutja_bonferroni)))
+cat(sprintf("    KO's que NO rebutgen la Gamma: %d / %d\n",
+            n_tests - sum(gamma_df$rebutja_bonferroni), n_tests))
+
+if (any(gamma_df$rebutja_bonferroni))
+  cat(sprintf("    KO's rebutjats: %s\n",
+              paste(gamma_df$ko[gamma_df$rebutja_bonferroni], collapse = ", ")))
+
+write.csv(gamma_df, file.path(OUT_DIR, "gamma_estimates.csv"), row.names = FALSE)
+
+# Vector representatiu KO → esperança, per al bloc següent
+ko_expected <- setNames(gamma_df$esperanca, gamma_df$ko)
+saveRDS(ko_expected, file.path(OUT_DIR, "ko_expected.rds"))
+```
+
+# BLOC 2 — Construcció del graf dirigit de reaccions
+
+Mapejam $\text{KO}\to\text{EC}\to\text{Reaccions}$ i posam una aresta $R_1\to R_2$ quan $\text{productes}(R_1)\cap\text{substrats}(R_2)\neq\varnothing$. Abans de calcular interseccions **excloem els compostos ubics**. Cada reacció reversible es desdobla en un node `_rev` amb substrats i productes intercanviats. Finalment ens quedam amb la component connexa feble més gran.
+
+```{r bloc2-mapejos}
+ko_ec_raw  <- fromJSON(PATH_KO_EC,  simplifyVector = FALSE)  # KO → enzims
+ec_rxn_raw <- fromJSON(PATH_EC_RXN, simplifyVector = FALSE)  # enzim → reaccions
+names(ec_rxn_raw) <- vapply(ec_rxn_raw, \(x) x$enzyme, character(1))
+rxn_raw <- fromJSON(PATH_RXN, simplifyVector = FALSE)        # info de reaccions
+names(rxn_raw) <- vapply(rxn_raw, \(x) x$reaction, character(1))
+
+# EC → reaccions catalitzades
+ec_to_rxns <- lapply(ec_rxn_raw, \(e) unique(unlist(e[["reaction"]])))
+names(ec_to_rxns) <- sapply(ec_rxn_raw, `[[`, "enzyme")
+
+# KO → reaccions (via EC), descartant KO sense cap reacció
+ko_to_rxns <- lapply(ko_ec_raw, function(ec_list) {
+  rxns <- unlist(lapply(unlist(ec_list), \(ec) ec_to_rxns[[ec]]))
+  unique(rxns[!is.null(rxns)])
+})
+names(ko_to_rxns) <- names(ko_ec_raw)
+ko_to_rxns <- Filter(\(x) length(x) > 0, ko_to_rxns)
+
+# Metadades de cada reacció: reversibilitat, substrats i productes
+rxn_meta <- tibble(
+  rxn_id     = sapply(rxn_raw, `[[`, "reaction"),
+  reversible = sapply(rxn_raw, \(r) isTRUE(r[["reversible"]])),
+  substrates = lapply(rxn_raw, \(r) unique(unlist(r[["substrate"]]))),
+  products   = lapply(rxn_raw, \(r) unique(unlist(r[["product"]])))
+)
+```
+
+```{r bloc2-funcio-graf}
+# ── Funció de construcció del graf ────────────────────────────────────────────
+build_cohort_graph <- function(abund_vec, ko_to_rxns, rxn_meta,
+                               label = "cohort",
+                               exclude_compounds = character(0)) {
+
+  # KO actius: abundància > 0 i amb mapeig a reaccions
+  active_kos <- intersect(names(abund_vec[abund_vec > 0]), names(ko_to_rxns))
+  cat(sprintf("    KO's actius amb mapeig: %d\n", length(active_kos)))
+  if (length(active_kos) == 0) stop("Cap KO actiu trobat.")
+
+  # Cada KO reparteix la seva esperança equitativament entre les seves reaccions;
+  # sumam per reacció (una mateixa reacció pot rebre de diversos KO)
+  rxn_abund_long <- lapply(active_kos, function(ko) {
+    rxns <- ko_to_rxns[[ko]]
+    tibble(rxn_id = rxns, frac_abund = abund_vec[[ko]] / length(rxns))
+  }) |>
+    bind_rows() |>
+    summarise(abundance = sum(frac_abund), .by = rxn_id)
+
+  active_rxns <- rxn_abund_long |>
+    filter(abundance > 0) |>
+    inner_join(rxn_meta, by = "rxn_id")
+  cat(sprintf("    Reaccions actives: %d\n", nrow(active_rxns)))
+
+  # Node duplicat "_rev" per a cada reacció reversible (substrats ↔ productes)
+  rev_rxns <- active_rxns |>
+  filter(reversible) |>
+  mutate(
+    .subs_orig = substrates,        # còpia dels originals
+    .prod_orig = products
+  ) |>
+  transmute(
+    rxn_id     = paste0(rxn_id, "_rev"),
+    abundance  = abundance,
+    reversible = TRUE,
+    substrates = .prod_orig,        # substrats de la inversa = productes de la directa
+    products   = .subs_orig         # productes de la inversa = substrats de la directa
+  )
+  active_rxns <- bind_rows(active_rxns, rev_rxns)
+  
+  
+# produced/consumed per node; excloem compostos ubics ABANS de les interseccions
+  produced <- active_rxns$products
+  consumed <- active_rxns$substrates
+  if (length(exclude_compounds) > 0) {
+    produced <- lapply(produced, \(x) setdiff(x, exclude_compounds))
+    consumed <- lapply(consumed, \(x) setdiff(x, exclude_compounds))
+  }
+
+  # Eliminam nodes que han quedat sense compostos connectables després de l'exclusió
+  te_compostos <- lengths(produced) > 0 & lengths(consumed) > 0
+  if (any(!te_compostos)) {
+    cat(sprintf("    Nodes eliminats (sense compostos després d'exclusió): %d\n",
+                sum(!te_compostos)))
+    active_rxns <- active_rxns[te_compostos, ]
+    produced    <- produced[te_compostos]
+    consumed    <- consumed[te_compostos]
+  }
+
+  # Índex invers (una sola vegada, sobre els conjunts ja filtrats)
+  all_consumed_cpds   <- unique(unlist(consumed))
+  cpd_to_consumer_idx <- setNames(
+    lapply(all_consumed_cpds, function(cpd)
+      which(vapply(consumed, \(x) cpd %in% x, logical(1)))),
+    all_consumed_cpds
+  )
+  
+  
+  
+  # Arestes R_i → R_j si un producte de R_i és substrat de R_j
+  edge_list <- lapply(seq_len(nrow(active_rxns)), function(i) {
+    cpds_produced <- produced[[i]]
+    if (length(cpds_produced) == 0) return(NULL)
+    targets <- unique(unlist(cpd_to_consumer_idx[cpds_produced], use.names = FALSE))
+    targets <- targets[targets != i]   # sense autoarestes
+    if (length(targets) == 0) return(NULL)
+    tibble(from = active_rxns$rxn_id[i], to = active_rxns$rxn_id[targets])
+  }) |> bind_rows()
+
+  cat(sprintf("    Arestes generades: %d\n",
+              if (is.null(edge_list) || nrow(edge_list) == 0) 0 else nrow(edge_list)))
+
+  nodes_df <- active_rxns |>
+    dplyr::select(rxn_id, abundance, reversible) |>
+    rename(name = rxn_id)
+
+  if (is.null(edge_list) || nrow(edge_list) == 0) {
+    g <- graph_from_data_frame(data.frame(from = character(0), to = character(0)),
+                               directed = TRUE, vertices = nodes_df)
+  } else {
+    g <- graph_from_data_frame(edge_list, directed = TRUE, vertices = nodes_df)
+  }
+
+  V(g)$out_degree <- degree(g, mode = "out")
+  V(g)$in_degree  <- degree(g, mode = "in")
+  graph_attr(g, "label") <- label
+  g
+}
+```
+
+```{r bloc2-construccio}
+cat("\n>> [2/4] Construint el graf de reaccions...\n")
+
+# Compostos ubics a excloure (aigua, ATP, ADP, NAD(P)(H), fosfat, etc.)
+exclude_cpds <- c("C00001", "C00002", "C00008", "C00006", "C00005",
+                  "C00003", "C00004", "C00010", "C00022", "C00024",
+                  "C00025", "C00009")
+
+g <- build_cohort_graph(ko_expected, ko_to_rxns, rxn_meta,
+                        label = "gamma_cohort_estimate",
+                        exclude_compounds = exclude_cpds)
+cat(sprintf("    Graf complet: %d nodes, %d arestes\n", vcount(g), ecount(g)))
+
+# ── Component connexa feble més gran ──────────────────────────────────────────
+comp       <- components(g, mode = "weak")
+largest_id <- which.max(comp$csize)
+g          <- induced_subgraph(g, V(g)[comp$membership == largest_id])
+
+# Recalculam graus després de retallar
+V(g)$out_degree <- degree(g, mode = "out")
+V(g)$in_degree  <- degree(g, mode = "in")
+
+cat(sprintf("    Component feble més gran: %d nodes, %d arestes\n",
+            vcount(g), ecount(g)))
+cat(sprintf("    (descartades %d components; %d nodes eliminats)\n",
+            comp$no - 1, sum(comp$csize) - max(comp$csize)))
+
+write_graph(g, file.path(OUT_DIR, "cohort_metabolic_graph.graphml"), format = "graphml")
+```
+
+# BLOC 3 — Matriu de transició (ponderada per abundància)
+
+El pes de $A\to B$ és proporcional a l'abundància del **node de destí** $B$. Ponderam la matriu d'adjacència per una diagonal d'abundàncies i normalitzam **per files**. Els nodes sense sortida (absorbents) reben un 1 a la diagonal. No es transposa: $P$ ha de ser estocàstica per files, $\text{rowSums}(P)=1$.
+
+```{r bloc3-transicio}
+cat("\n>> [3/4] Construint la matriu de transició P...\n")
+
+n_states   <- vcount(g)
+node_names <- V(g)$name
+
+# Matriu d'adjacència A[i,j] = 1 si hi ha aresta i → j
+A <- as_adjacency_matrix(g, sparse = TRUE)
+
+# Ponderació: multiplicam cada columna B per abundance(B)
+abundancies <- as.numeric(V(g)$abundance)
+T_pond <- A %*% Matrix::Diagonal(x = abundancies)
+
+# Suma per files i identificació d'estats absorbents (fila a zero)
+suma_files      <- Matrix::rowSums(T_pond)
+d               <- ifelse(suma_files == 0, 1, 0)          # 1 als absorbents
+absorbing_nodes <- node_names[suma_files == 0]
+transient_out   <- node_names[suma_files != 0]            # tenen almenys una sortida
+
+cat(sprintf("    Nodes sense sortida (absorbents estructurals): %d\n",
+            length(absorbing_nodes)))
+cat(sprintf("    Nodes amb sortida: %d\n", length(transient_out)))
+
+# Evitam divisió per zero i normalitzam per files; afegim la diagonal absorbent.
+# NO transposam → estocàstica per files.
+suma_files[suma_files == 0] <- 1
+D_inv <- Matrix::Diagonal(x = 1 / suma_files)
+D_d   <- Matrix::Diagonal(x = d)
+
+P <- (D_inv %*% T_pond) + D_d
+dimnames(P) <- list(node_names, node_names)
+
+# Verificació d'estocasticitat per files
+row_sums <- Matrix::rowSums(P)
+if (all(abs(row_sums - 1) < 1e-9)) {
+  cat("    [OK] Totes les files de P sumen 1.\n")
+} else {
+  warning(sprintf("    [AVÍS] %d files no sumen 1.", sum(abs(row_sums - 1) >= 1e-9)))
+}
+cat(sprintf("    Matriu P: %d×%d, %.4f%% no-zero\n",
+            nrow(P), ncol(P), 100 * nnzero(P) / (nrow(P) * ncol(P))))
+
+saveRDS(A, file.path(OUT_DIR, "adjacency_matrix.rds"))
+saveRDS(P, file.path(OUT_DIR, "transition_matrix.rds"))
+```
+
+# BLOC 4 — Anàlisi de la cadena de Markov
+
+Analitzam $P$ com a cadena de Markov en temps discret: classificació d'estats (absorbents, transitoris, recurrents), ergodicitat, distribució estacionària —una per cada classe recurrent, atès que amb estats absorbents la cadena és reductible— i comprovació del balanç detallat (reversibilitat).
+
+```{r bloc4-classificacio}
+cat("\n>> [4/4] Anàlisi de la cadena de Markov...\n\n")
+
+# ── Classes de comunicació ───────────────────────────────────────────────────
+# Les classes de comunicació són les components fortament connexes del graf de la
+# cadena (arestes = transicions amb probabilitat > 0). Una classe és RECURRENT
+# (tancada) si cap aresta en surt cap a una altra classe; altrament és TRANSITÒRIA.
+g_chain <- graph_from_adjacency_matrix(P > 0, mode = "directed", diag = FALSE)
+
+scc      <- components(g_chain, mode = "strong")
+memb     <- scc$membership                    # classe de cada estat
+n_class  <- scc$no
+
+# Graf condensat entre classes: hi ha aresta C1→C2 si algun estat de C1 va a C2
+class_of <- memb
+edges_between_classes <- which(as.matrix(P > 0), arr.ind = TRUE)
+from_cl <- class_of[edges_between_classes[, 1]]
+to_cl   <- class_of[edges_between_classes[, 2]]
+inter   <- from_cl != to_cl                   # arestes que surten de la classe
+
+# Una classe és tancada (recurrent) si no té cap aresta de sortida a una altra classe
+classes_amb_sortida <- unique(from_cl[inter])
+recurrent_classes   <- setdiff(seq_len(n_class), classes_amb_sortida)
+
+is_recurrent_state <- memb %in% recurrent_classes
+recurrent_states   <- node_names[is_recurrent_state]
+transient_states   <- node_names[!is_recurrent_state]
+
+# Estat absorbent: classe recurrent de mida 1 amb P[i,i] = 1
+diagP <- Matrix::diag(P)
+absorbing_states <- node_names[
+  is_recurrent_state &
+  (ave(memb, memb, FUN = length) == 1) &
+  (abs(diagP - 1) < 1e-12)
+]
+
+cat(sprintf("Nombre d'estats: %d\n", n_states))
+cat(sprintf("Nombre de classes de comunicació: %d\n", n_class))
+cat(sprintf("  · Estats recurrents: %d (en %d classes tancades)\n",
+            length(recurrent_states), length(recurrent_classes)))
+cat(sprintf("  · Estats transitoris: %d\n", length(transient_states)))
+cat(sprintf("  · Dels recurrents, estats absorbents (classe unitària): %d\n",
+            length(absorbing_states)))
+
+# Mostra reduïda per no inundar la consola
+show_head <- function(v, k = 10)
+  if (length(v) == 0) "(cap)" else
+    paste0(paste(head(v, k), collapse = ", "),
+           if (length(v) > k) sprintf(", … (+%d)", length(v) - k) else "")
+
+cat("\n  Absorbents:  ", show_head(absorbing_states), "\n", sep = "")
+cat("  Transitoris: ", show_head(transient_states), "\n", sep = "")
+cat("  Recurrents:  ", show_head(recurrent_states),  "\n", sep = "")
+
+# Mida (ordre) de cada classe de comunicació
+mides <- as.integer(table(memb))            # nombre de nodes per classe
+names(mides) <- names(table(memb))          # identificador de classe
+
+# ── Les tres classes més grans ────────────────────────────────────────────────
+top3 <- sort(mides, decreasing = TRUE)[1:3]
+cat("Tres classes més grans (classe = nombre de nodes):\n")
+for (i in seq_along(top3))
+  cat(sprintf("  %d. classe_%s: %d nodes\n", i, names(top3)[i], top3[i]))
+
+# ── Moda de l'ordre ───────────────────────────────────────────────────────────
+# Quantes classes hi ha de cada mida, i quina mida és la més freqüent
+distrib_mides <- table(mides)               # mida -> nombre de classes amb aquesta mida
+moda_ordre    <- as.integer(names(distrib_mides)[which.max(distrib_mides)])
+n_classes_moda <- max(distrib_mides)
+
+cat(sprintf("\nModa de l'ordre: %d node(s), compartida per %d classes.\n",
+            moda_ordre, n_classes_moda))
+cat("\nDistribució de mides (mida : nombre de classes):\n")
+print(distrib_mides)
+```
+
+```{r bloc4-ergodicitat}
+# ── Ergodicitat ───────────────────────────────────────────────────────────────
+# Una cadena finita és ergòdica quan és irreductible (una sola classe) i aperiòdica.
+# Amb múltiples classes o estats absorbents NO és ergòdica.
+is_irreducible <- (n_class == 1)
+
+periodicitat_classe <- function(estats_idx) {
+  # gcd de les longituds dels cicles dins la classe; 1 = aperiòdica
+  sub <- induced_subgraph(g_chain, estats_idx)
+  if (ecount(sub) == 0) return(NA_integer_)
+  # Aproximació pràctica: si hi ha algun self-loop, període 1
+  if (any(Matrix::diag(P)[estats_idx] > 0)) return(1L)
+  # Altrament, provam via girth (longitud del cicle més curt) com a fita
+  gt <- tryCatch(igraph::girth(sub)$girth, error = \(e) NA_real_)
+  if (is.na(gt) || gt == 0) NA_integer_ else as.integer(gt)
+}
+
+if (is_irreducible) {
+  per <- periodicitat_classe(seq_len(n_states))
+  is_aperiodic <- !is.na(per) && per == 1
+  is_ergodic   <- is_irreducible && is_aperiodic
+  cat(sprintf("\nCadena irreductible: SÍ. Període estimat: %s.\n",
+              ifelse(is.na(per), "indeterminat", per)))
+  cat(sprintf("La cadena %s ergòdica.\n", ifelse(is_ergodic, "ÉS", "NO és")))
+} else {
+  is_ergodic <- FALSE
+  cat("\nCadena irreductible: NO (té més d'una classe de comunicació).\n")
+  cat("Per tant, la cadena NO és ergòdica.\n")
+}
+```
+
+```{r bloc4-estacionaria}
+# ── Distribució estacionària ──────────────────────────────────────────────────
+# Amb reductibilitat no hi ha una única estacionària: n'hi ha una per classe
+# recurrent tancada. Per a cada classe C resolem pi_C · P_C = pi_C (autovector
+# esquerre associat a l'autovalor 1) restringint P a la submatriu de la classe.
+estacionaria_classe <- function(estats_idx) {
+  Pc <- as.matrix(P[estats_idx, estats_idx, drop = FALSE])
+  # Renormalitzam per seguretat (les files ja sumen 1 dins una classe tancada)
+  Pc <- Pc / rowSums(Pc)
+  # Autovector esquerre per a l'autovalor 1: eigen de t(Pc)
+  ev  <- eigen(t(Pc))
+  k   <- which.min(abs(ev$values - 1))          # autovalor més proper a 1
+  vec <- Re(ev$vectors[, k])
+  vec <- vec / sum(vec)                          # normalitzam a probabilitat
+  # Garantim signe i no-negativitat
+  if (any(vec < -1e-8)) vec <- abs(vec) / sum(abs(vec))
+  setNames(pmax(vec, 0) / sum(pmax(vec, 0)), node_names[estats_idx])
+}
+stationary_list <- lapply(recurrent_classes, function(cl) {
+  estats_idx <- which(memb == cl)
+  estacionaria_classe(estats_idx)
+})
+names(stationary_list) <- paste0("classe_", recurrent_classes)
+
+# Vector estacionari global (concatenació de classes recurrents; 0 als transitoris)
+pi_global <- setNames(numeric(n_states), node_names)
+for (pi_c in stationary_list) pi_global[names(pi_c)] <- pi_c
+
+# ── Taula resum de totes les classes ──────────────────────────────────────────
+# Una fila per classe (recurrents i transitòries). Columnes:
+#   - classe            : identificador de la classe
+#   - tipus             : recurrent / transitòria
+#   - nombre_estats     : mida de la classe
+#   - te_estacionaria   : TRUE per a classes recurrents tancades, FALSE altrament
+#   - distribucio       : distribució estacionària resumida (top estats) o NA
+fmt_dist <- function(pi_c, top = 3) {
+  top_pi <- sort(pi_c, decreasing = TRUE)
+  top_pi <- head(top_pi, top)
+  paste(sprintf("%s=%.4f", names(top_pi), top_pi), collapse = "; ")
+}
+
+totes_classes <- sort(unique(memb))
+taula_estacionaria <- do.call(rbind, lapply(totes_classes, function(cl) {
+  estats_idx <- which(memb == cl)
+  es_recurrent <- cl %in% recurrent_classes
+  nm <- paste0("classe_", cl)
+  data.frame(
+    classe          = nm,
+    tipus           = if (es_recurrent) "recurrent" else "transitòria",
+    nombre_estats   = length(estats_idx),
+    te_estacionaria = es_recurrent,
+    distribucio     = if (es_recurrent) fmt_dist(stationary_list[[nm]]) else NA_character_,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(taula_estacionaria) <- NULL
+
+cat(sprintf("\nDistribució estacionària: %d classe(s) recurrent(s) de %d classe(s) totals.\n",
+            length(stationary_list), length(totes_classes)))
+print(taula_estacionaria, right = FALSE)
+
+# Versió amb kable si es renderitza a HTML (opcional, més llegible)
+if (requireNamespace("knitr", quietly = TRUE)) {
+  print(knitr::kable(
+    taula_estacionaria,
+    col.names = c("Classe", "Tipus", "Nre. estats",
+                  "Té estacionària?", "Distribució (top 3)"),
+    caption = "Resum de classes i distribucions estacionàries"
+  ))
+}
+
+saveRDS(stationary_list,    file.path(OUT_DIR, "stationary_by_class.rds"))
+saveRDS(pi_global,          file.path(OUT_DIR, "stationary_global.rds"))
+saveRDS(taula_estacionaria, file.path(OUT_DIR, "stationary_table.rds"))
+write.csv(taula_estacionaria,
+          file.path(OUT_DIR, "stationary_table.csv"), row.names = FALSE)
+```
+
+```{r bloc4-balanc-detallat}
+# ── Balanç detallat (reversibilitat) ──────────────────────────────────────────
+# La cadena és reversible respecte a pi si  pi_i P_ij = pi_j P_ji  per a tot i,j.
+# Ho comprovam DINS de cada classe recurrent (on pi està definida), amb tolerància.
+TOL <- 1e-8
+
+comprova_balanc_classe <- function(estats_idx, pi_c) {
+  Pc  <- as.matrix(P[estats_idx, estats_idx, drop = FALSE])
+  nm  <- node_names[estats_idx]
+  pv  <- pi_c[nm]
+  F   <- pv * Pc                       # F_ij = pi_i P_ij (flux i→j)
+  dif <- abs(F - t(F))                 # |pi_i P_ij − pi_j P_ji|
+  max_dif  <- max(dif)
+  n_violac <- sum(dif[upper.tri(dif)] > TOL)
+  list(max_dif = max_dif, n_violac = n_violac,
+       reversible = (max_dif <= TOL))
+}
+
+cat("\nComprovació del balanç detallat (tolerància 1e-8):\n")
+global_reversible <- TRUE
+for (k in seq_along(recurrent_classes)) {
+  cl         <- recurrent_classes[k]
+  estats_idx <- which(memb == cl)
+  pi_c       <- stationary_list[[k]]
+  if (length(estats_idx) == 1) {                 # classe unitària: trivialment reversible
+    cat(sprintf("  classe_%d: 1 estat (absorbent) → reversible trivialment.\n", cl))
+    next
+  }
+  res <- comprova_balanc_classe(estats_idx, pi_c)
+  global_reversible <- global_reversible && res$reversible
+  cat(sprintf("  classe_%d (%d estats): max|pi_i P_ij − pi_j P_ji| = %.3e; violacions = %d → %s\n",
+              cl, length(estats_idx), res$max_dif, res$n_violac,
+              ifelse(res$reversible, "REVERSIBLE", "NO reversible")))
+}
+
+cat(sprintf("\nConclusió: la cadena %s reversible respecte a la seva distribució estacionària.\n",
+            ifelse(global_reversible, "ÉS", "NO és")))
+```
+
+```{r bloc4-absorcio}
+# ── Anàlisi d'absorció (cadena reductible amb classes tancades) ────────────────
+# Forma canònica  P = [[Q, R],[0, I]]  amb Q = transitori→transitori. La matriu
+# fonamental N = (I - Q)^{-1} (existeix perquè el radi espectral de Q és < 1, en
+# ser tots aquests estats transitoris) dóna:
+#   · t = N · 1        : temps esperat d'absorció des de cada transitori
+#   · B = N · R_classe : probabilitat d'absorció a cada classe recurrent
+library(Matrix)
+
+trans_idx <- which(!is_recurrent_state)          # índexs dels estats transitoris
+n_trans   <- length(trans_idx)
+
+Q   <- P[trans_idx, trans_idx, drop = FALSE]     # submatriu transitori → transitori (dispersa)
+ImQ <- Diagonal(n_trans) - Q                     # (I - Q)
+
+# R agregada per classe: R_classe[i, C] = prob. d'anar en 1 passa de i a la classe C
+R_classe <- do.call(cbind, lapply(recurrent_classes, function(cl) {
+  cols <- which(memb == cl)                      # estats d'aquesta classe tancada
+  as.numeric(rowSums(P[trans_idx, cols, drop = FALSE]))
+}))
+colnames(R_classe) <- paste0("classe_", recurrent_classes)
+
+# Resolem els sistemes:  (I - Q) t = 1   i   (I - Q) B = R_classe
+t_abs <- as.numeric(solve(ImQ, rep(1, n_trans)))
+names(t_abs) <- node_names[trans_idx]
+
+B_abs <- as.matrix(solve(ImQ, R_classe))         # n_trans × n_classes_recurrents
+rownames(B_abs) <- node_names[trans_idx]
+colnames(B_abs) <- colnames(R_classe)
+
+# ── Comprovacions de sanitat ──────────────────────────────────────────────────
+# En una cadena finita l'absorció és certa: cada fila de B ha de sumar 1.
+rs <- rowSums(B_abs)
+cat(sprintf("\nAbsorció — suma per files de B ∈ [%.6f, %.6f] (ha de ser 1).\n",
+            min(rs), max(rs)))
+cat(sprintf("Temps d'absorció (passes): min = %.2f, mediana = %.2f, max = %.2f.\n",
+            min(t_abs), median(t_abs), max(t_abs)))
+
+# ── Resum per estat transitori ────────────────────────────────────────────────
+# Classe recurrent més probable i la seva probabilitat, per a cada transitori.
+idx_max         <- max.col(B_abs, ties.method = "first")
+classe_probable <- colnames(B_abs)[idx_max]
+prob_probable   <- B_abs[cbind(seq_len(n_trans), idx_max)]
+
+taula_absorcio <- data.frame(
+  estat           = node_names[trans_idx],
+  temps_absorcio  = round(t_abs, 3),
+  classe_probable = classe_probable,
+  prob_classe     = round(prob_probable, 4),
+  stringsAsFactors = FALSE
+)
+taula_absorcio <- taula_absorcio[order(-taula_absorcio$temps_absorcio), ]
+rownames(taula_absorcio) <- NULL
+
+cat("\n  Estats transitoris amb major temps esperat d'absorció:\n")
+print(utils::head(taula_absorcio, 10), right = FALSE)
+
+# ── Desat ─────────────────────────────────────────────────────────────────────
+saveRDS(B_abs,          file.path(OUT_DIR, "absorption_probabilities.rds"))
+saveRDS(t_abs,          file.path(OUT_DIR, "absorption_times.rds"))
+saveRDS(taula_absorcio, file.path(OUT_DIR, "absorption_summary.rds"))
+write.csv(taula_absorcio,
+          file.path(OUT_DIR, "absorption_summary.csv"), row.names = FALSE)
+# ── Comprovació de fiabilitat numèrica del sistema d'absorció ──────────────────
+# Residu dels dos sistemes que has resolt: com més petit, més fiable la solució.
+res_t <- max(abs(as.numeric(ImQ %*% t_abs) - 1))          # (I - Q) t = 1
+res_B <- max(abs(as.matrix(ImQ %*% B_abs) - R_classe))    # (I - Q) B = R_classe
+
+cat(sprintf("Residu màxim del sistema de temps    (I-Q)t = 1 : %.2e\n", res_t))
+cat(sprintf("Residu màxim del sistema de probs (I-Q)B = R    : %.2e\n", res_B))
+
+# Interpretació ràpida
+if (max(res_t, res_B) < 1e-6) {
+  cat("→ Residus petits: la solució és fiable tot i els temps grans.\n")
+} else {
+  cat("→ Residus no negligibles: tracta els temps grans com a ordres de magnitud.\n")
+}
+```
+

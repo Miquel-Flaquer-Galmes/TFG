@@ -1,0 +1,623 @@
+---
+title: "dendogrames"
+format: html
+editor: visual
+---
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(jsonlite)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(Matrix)
+  library(lsa)
+  library(dendextend)
+  library(ape)
+  library(phangorn)
+})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. CONFIGURACIÓ INICIAL
+# ───────────────────────────────────────────────────────────────────────
+
+ABUND_FILE  <- "Mostres/KoreanWestern.csv"
+KO_EC_FILE  <- "Dades_Pere/enzymes_KO.json"
+EC_RXN_FILE <- "Dades_Pere/enzymes_lite_new.json"
+RXN_FILE    <- "Dades_Pere/reactions_lite_pw.json"
+META_FILE   <- "Mostres/Results.csv"
+ITER_CONFIGS <- list("1" = 1, "5" = 5, "max_diam" = "max_diam")
+K_CUTS <- c(2)   # talls a provar
+
+OUT_DIR     <- "Dendogrames_KW"     # carpeta de sortida per als dendrogrames
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+N_REP       <- 30                     # nombre de rèpliques simulades
+CLUST_METHOD <- "complete"              # mètode de hclust (UPGMA)
+
+exclude_cpds <- c("C00001","C00002","C00008","C00006","C00005","C00003",
+                  "C00004","C00010","C00022","C00024","C00025","C00009")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. LECTURA I PREPROCESSAMENT (una sola vegada, fora del bucle)
+# ─────────────────────────────────────────────────────────────────────────────
+abund_raw <- read.csv(ABUND_FILE, row.names = 1, check.names = FALSE)
+# files = KOs, columnes = pacients
+# Filtre de prevalença: mantenim KOs presents en > 25% de les mostres
+proporcio  <- rowMeans(abund_raw > 0)
+abund_bin  <- as.matrix(abund_raw[proporcio > 0.25, , drop = FALSE])
+
+
+ko_names      <- rownames(abund_bin)
+patient_ids   <- colnames(abund_bin)
+
+# ── Mapeig KO → Reaccions i metadades de reaccions (INVARIANTS: fora del bucle) ─
+ko_ec_raw  <- fromJSON(KO_EC_FILE,  simplifyVector = FALSE)
+ec_rxn_raw <- fromJSON(EC_RXN_FILE, simplifyVector = FALSE)
+rxn_raw    <- fromJSON(RXN_FILE,    simplifyVector = FALSE)
+
+names(ec_rxn_raw) <- vapply(ec_rxn_raw, function(x) x$enzyme,   character(1))
+names(rxn_raw)    <- vapply(rxn_raw,    function(x) x$reaction, character(1))
+
+ec_to_rxns <- lapply(ec_rxn_raw, function(ec_entry) unique(unlist(ec_entry[["reaction"]])))
+names(ec_to_rxns) <- vapply(ec_rxn_raw, function(x) x$enzyme, character(1))
+
+ko_to_rxns <- lapply(ko_ec_raw, function(ec_list) {
+  rxns <- unlist(lapply(unlist(ec_list), function(ec) ec_to_rxns[[ec]]))
+  unique(rxns[!is.null(rxns)])
+})
+names(ko_to_rxns) <- names(ko_ec_raw)
+ko_to_rxns <- Filter(function(x) length(x) > 0, ko_to_rxns)
+
+rxn_meta <- tibble(
+  rxn_id     = vapply(rxn_raw, function(r) r[["reaction"]], character(1)),
+  reversible = sapply(rxn_raw, function(r) isTRUE(r[["reversible"]])),
+  substrates = lapply(rxn_raw, function(r) unique(unlist(r[["substrate"]]))),
+  products   = lapply(rxn_raw, function(r) unique(unlist(r[["product"]])))
+)
+
+# ── Etiquetes reals (Western/Korean) a partir del codi de la mostra ──────────
+meta  <- read.csv(META_FILE, nrows = length(patient_ids), stringsAsFactors = FALSE)
+codi  <- sub("^[^_]+_([A-Z]+)_.*$", "\\1", meta$organism)   # WLB, KLA, ...
+grup  <- ifelse(substr(codi, 1, 1) == "W", "Western", "Korean")
+
+# etiqueta: pacient → grup (l'usarem per assignar color, no per mostrar text)
+etiqueta <- setNames(grup, meta$organism)
+# ── Etiquetes curtes: CODI_NúmeroPacient (columnes de dos en dos = mateix pacient) ─
+# Extraiem el codi del mig (WLB, WLA, KHB, ...) de cada identificador de columna
+codi_mig <- sub("^[^_]+_([A-Za-z]+)_.*$", "\\1", patient_ids)
+
+# Cada 2 columnes = 1 pacient → número de pacient 01, 01, 02, 02, ...
+num_pacient <- sprintf("%02d", ((seq_along(patient_ids) - 1) %/% 2) + 1)
+
+# Etiqueta curta final: CODI_NN  (p.ex. WLB_01, WLA_01, WLB_02, ...)
+etiqueta_curta <- setNames(paste0(codi_mig, "_", num_pacient), patient_ids)
+
+message("Exemple etiquetes curtes: ",
+        paste(head(etiqueta_curta, 4), collapse = ", "))
+
+message("Etiquetes reals: ", paste(names(table(etiqueta)),
+                                    table(etiqueta), sep = "=", collapse = ", "))
+
+# ── Paleta de colors per grup ────────────────────────────────────────────────
+COLORS_GRUP <- c(
+  "Korean"  = "#006400",  # verd
+  "Western" = "#00008B"   # blau
+)
+
+grups_sense_color <- setdiff(unique(etiqueta), names(COLORS_GRUP))
+if (length(grups_sense_color) > 0)
+  warning("Grups sense color: ", paste(grups_sense_color, collapse = ", "))
+```
+
+```{r funcions}
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. PARÀMETRES GAMMA PER KO (fixats un cop, iguals per a totes les rèpliques)
+# ─────────────────────────────────────────────────────────────────────────────
+# Per a cada KO generem un shape (alpha) i un rate (beta) aleatoris. Els rangs
+# són arbitraris però donen abundàncies positives amb variabilitat raonable;
+# ajusta'ls si tens coneixement previ sobre la distribució real d'abundàncies.
+
+n_ko        <- length(ko_names)
+
+
+# FUNCIONS DEL PIPELINE
+
+reaction_graph_patient <- function(patient_id, abund_vec, ko_to_rxns, 
+rxn_meta,                                    exclude_compounds = character(0)) 
+  {
+  active_kos <- names(abund_vec)[abund_vec > 0]
+  active_kos <- intersect(active_kos, names(ko_to_rxns))
+  if (length(active_kos) == 0) return(NULL)
+
+  rxn_abund_long <- lapply(active_kos, function(ko) {
+    rxns <- ko_to_rxns[[ko]]
+    tibble(rxn_id = rxns, frac_abund = abund_vec[[ko]] / length(rxns))
+  }) |>
+    bind_rows() |>
+    summarise(abundance = sum(frac_abund), .by = rxn_id)
+
+  active_rxns <- rxn_abund_long |>
+    filter(abundance > 0) |>
+    inner_join(rxn_meta, by = "rxn_id")
+  if (nrow(active_rxns) == 0) return(NULL)
+
+  rev_rxns <- active_rxns |>
+  filter(reversible) |>
+  mutate(
+    .subs_orig = substrates,        # còpia dels originals
+    .prod_orig = products
+  ) |>
+  transmute(
+    rxn_id     = paste0(rxn_id, "_rev"),
+    abundance  = abundance,
+    reversible = TRUE,
+    substrates = .prod_orig,        # substrats de la inversa = productes de la directa
+    products   = .subs_orig         # productes de la inversa = substrats de la directa
+  )
+  active_rxns <- bind_rows(active_rxns, rev_rxns)
+
+
+  n_rxn    <- nrow(active_rxns)
+  produced <- active_rxns$products
+  consumed <- active_rxns$substrates
+  if (length(exclude_compounds) > 0) {
+    produced <- lapply(produced, function(x) setdiff(x, exclude_compounds))
+    consumed <- lapply(consumed, function(x) setdiff(x, exclude_compounds))
+  }
+
+  all_consumed_cpds <- unique(unlist(consumed))
+  cpd_to_consumer_idx <- setNames(
+    lapply(all_consumed_cpds, function(cpd)
+      which(vapply(consumed, function(x) cpd %in% x, logical(1)))),
+    all_consumed_cpds
+  )
+
+  edge_list <- lapply(seq_len(n_rxn), function(i) {
+    cpds_produced <- produced[[i]]
+    if (length(cpds_produced) == 0) return(NULL)
+    targets <- unique(unlist(cpd_to_consumer_idx[cpds_produced], use.names = FALSE))
+    targets <- targets[targets != i]
+    if (length(targets) == 0) return(NULL)
+    tibble(from = active_rxns$rxn_id[i], to = active_rxns$rxn_id[targets])
+  }) |> bind_rows()
+
+  nodes_df <- active_rxns |>
+    dplyr::select(rxn_id, abundance, reversible) |>
+    rename(name = rxn_id)
+
+  if (nrow(edge_list) == 0) {
+    g <- graph_from_data_frame(data.frame(from = character(0), to = character(0)),
+                               directed = TRUE, vertices = nodes_df)
+  } else {
+    g <- graph_from_data_frame(edge_list, directed = TRUE, vertices = nodes_df)
+  }
+  graph_attr(g, "patient_id") <- patient_id
+  g
+}
+
+matriu_propagacio <- function(G){
+  A <- as_adjacency_matrix(G, sparse = TRUE)
+  abundancies <- as.numeric(V(G)$abundance)
+  T_pond    <- A %*% Matrix::Diagonal(x = abundancies)
+  suma_files <- Matrix::rowSums(T_pond)
+  d <- ifelse(suma_files == 0, 1, 0)
+  suma_files[suma_files == 0] <- 1
+  D_inv <- Matrix::Diagonal(x = 1/suma_files)
+  D_d   <- Matrix::Diagonal(x = d)
+  T_prop <- (D_inv %*% T_pond) + D_d
+  t(T_prop)
+}
+
+maj_comp_con <- function(g, mode = "weak") {
+  comp <- components(g, mode = mode)
+  idx  <- which.max(comp$csize)
+  induced_subgraph(g, which(comp$membership == idx))
+}
+
+Prop_att_ker <- function(G1, G2, iteracions, calc_maj_comp = FALSE, MP1 = NULL, MP2 = NULL)
+  {
+  if (calc_maj_comp){ G1 <- maj_comp_con(G1); G2 <- maj_comp_con(G2) }
+  if (isFALSE(iteracions)){
+    iteracions <- max(diameter(G1, directed = TRUE, unconnected = TRUE),
+                      diameter(G2, directed = TRUE, unconnected = TRUE))
+  }
+  etiquetes_1 <- V(G1)$name; etiquetes_2 <- V(G2)$name
+  conjunt_etiquetes <- unique(c(etiquetes_1, etiquetes_2))
+  pesos_1 <- as.numeric(V(G1)$abundance)
+  pesos_2 <- as.numeric(V(G2)$abundance)
+  idx1 <- match(etiquetes_1, conjunt_etiquetes)
+  idx2 <- match(etiquetes_2, conjunt_etiquetes)
+  p1 <- numeric(length(conjunt_etiquetes)); p1[idx1] <- pesos_1
+  p2 <- numeric(length(conjunt_etiquetes)); p2[idx2] <- pesos_2
+  if (is.null(MP1)) MP1 <- matriu_propagacio(G1)
+  if (is.null(MP2)) MP2 <- matriu_propagacio(G2)
+  sim <- cosine(p1, p2)
+  if (iteracions > 1){
+    for (i in 2:iteracions){
+      pesos_1 <- as.numeric(MP1 %*% pesos_1)
+      pesos_2 <- as.numeric(MP2 %*% pesos_2)
+      p1[idx1] <- pesos_1; p2[idx2] <- pesos_2
+      sim <- sim + cosine(p1, p2)
+    }
+  }
+  sim
+}
+
+# ── Helper: construeix tots els grafs + precomputa MP i diàmetre per una rèplica ─
+build_precomp <- function(abund_mat) {
+  graphs <- list()
+  for (pid in patient_ids) {
+    abund_vec <- setNames(abund_mat[, pid], ko_names)
+    g <- reaction_graph_patient(pid, abund_vec, ko_to_rxns, rxn_meta, exclude_cpds)
+    if (!is.null(g)) graphs[[pid]] <- g
+  }
+  lapply(graphs, function(g) {
+    gc <- maj_comp_con(g)
+    list(graf = gc,
+         MP   = matriu_propagacio(gc),
+         diam = diameter(gc, directed = TRUE, unconnected = TRUE))
+  })
+}
+
+# ── Helper: matriu de similitud normalitzada a partir del precomp ────────────
+kernel_matrix <- function(precomp, n_iter) {
+  ids <- names(precomp); n <- length(ids)
+  if (identical(n_iter, "max_diam")) {
+    n_iter <- max(vapply(precomp, function(x) x$diam, numeric(1)))
+  }
+  M <- matrix(0, n, n, dimnames = list(ids, ids))
+  for (i in 1:n) for (j in i:n) {
+    val <- Prop_att_ker(precomp[[i]]$graf, precomp[[j]]$graf,
+                        iteracions = n_iter, calc_maj_comp = FALSE,
+                        MP1 = precomp[[i]]$MP, MP2 = precomp[[j]]$MP)
+    M[i, j] <- val; M[j, i] <- val
+  }
+  arrels <- sqrt(diag(M))
+  M / outer(arrels, arrels)
+}
+
+```
+
+```{r prova_uniforme}
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVA ESPECIAL: 1 iteració, abundàncies de node = 1 (presència/absència pura)
+# ─────────────────────────────────────────────────────────────────────────────
+# Determinista: no cal replicar ni fixar llavor (no hi ha rgamma/runif).
+# Amb tots els pesos a 1 i 1 iteració, el kernel es redueix al cosinus entre
+# els vectors indicadors de reaccions presents (índex d'Ochiai); la matriu de
+# propagació no s'usa (només entraria a partir de la 2a iteració).
+
+# ── Precomp amb abundàncies uniformes: tots els nodes valen 1 ────────────────
+build_precomp_unif <- function(abund_mat) {
+  graphs <- list()
+  for (pid in patient_ids) {
+    abund_vec <- setNames(abund_mat[, pid], ko_names)
+    g <- reaction_graph_patient(pid, abund_vec, ko_to_rxns, rxn_meta, exclude_cpds)
+    if (!is.null(g)) {
+      V(g)$abundance <- rep(1, vcount(g))   # ← forçam abundància 1 a cada reacció
+      graphs[[pid]] <- g
+    }
+  }
+  lapply(graphs, function(g) {
+    gc <- maj_comp_con(g)
+    V(gc)$abundance <- rep(1, vcount(gc))   # per si la subcomponent l'ha alterat
+    list(graf = gc,
+         MP   = matriu_propagacio(gc),
+         diam = diameter(gc, directed = TRUE, unconnected = TRUE))
+  })
+}
+
+prova_dir <- file.path(OUT_DIR, "prova_uniforme")
+dir.create(prova_dir, showWarnings = FALSE, recursive = TRUE)
+
+precomp_u <- build_precomp_unif(abund_bin)   # directament la matriu 0/1
+M_u <- kernel_matrix(precomp_u, 1)           # una sola iteració
+
+D_u  <- as.dist(1 - M_u)
+hc_u <- hclust(D_u, method = CLUST_METHOD)
+saveRDS(hc_u, file.path(prova_dir, "hc_uniforme.rds"))
+
+ids_u <- rownames(M_u)
+
+# Dendrograma base amb etiquetes acolorides
+dend <- as.dendrogram(hc_u)
+ordre      <- order.dendrogram(dend)
+ids_ordre  <- ids_u[ordre]
+grups_ord  <- etiqueta[match(ids_ordre, names(etiqueta))]
+cols_ordre <- unname(COLORS_GRUP[grups_ord])
+cols_ordre[is.na(cols_ordre)] <- "black"
+
+labels(dend)        <- unname(etiqueta_curta[ids_ordre])
+labels_colors(dend) <- cols_ordre
+labels_cex(dend)    <- 0.8
+
+# Un dendrograma per cada nombre de clústers
+for (kc in K_CUTS) {
+  png(file.path(prova_dir, sprintf("dendrograma_uniforme_1iter_k%d.png", kc)),
+      width = 11, height = 7, units = "in", res = 150)
+  par(mar = c(10, 4, 4, 2))
+  plot(dend,
+       main = sprintf("Abundàncies de node = 1 — 1 iteració — k=%d", kc),
+       ylab = "Distància (1 - similitud)")
+  rect.dendrogram(dend, k = kc, border = "grey40", lty = 2)
+  legend("topright", legend = names(COLORS_GRUP), fill = COLORS_GRUP,
+         cex = 0.7, bty = "n", ncol = 2)
+  dev.off()
+}
+
+write.csv(M_u, file.path(prova_dir, "matriu_similitud_uniforme.csv"))
+```
+
+```{r bucle_principal, eval=TRUE}
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. BUCLE PRINCIPAL: 30 RÈPLIQUES × 3 configuracions d'iteracions
+# ─────────────────────────────────────────────────────────────────────────────
+set.seed(42)
+gamma_shape <- setNames(runif(n_ko, min = 3, max = 12),   ko_names)  # alpha ∈ [1,5]
+gamma_rate  <- setNames(runif(n_ko, min = 0.01, max = 1), ko_names)  # beta  ∈ [0.5,2]
+ones_idx <- which(abund_bin > 0, arr.ind = TRUE)
+ones_ko  <- ko_names[ones_idx[, "row"]]
+
+
+# Una matriu d'assignacions per cada (configuració d'iteracions × K_CUT)
+assignacions <- lapply(ITER_CONFIGS, function(x)
+  setNames(
+    lapply(K_CUTS, function(k)
+      matrix(NA_integer_, nrow = length(patient_ids), ncol = N_REP,
+             dimnames = list(patient_ids, paste0("rep", 1:N_REP)))),
+    as.character(K_CUTS)))
+
+for (rep in seq_len(N_REP)) {
+  message("── Rèplica ", rep, "/", N_REP, " ──────────────────────────────")
+
+  # (a) Simulació d'abundàncies
+  abund_sim <- matrix(0, nrow = nrow(abund_bin), ncol = ncol(abund_bin),
+                      dimnames = dimnames(abund_bin))
+  abund_sim[ones_idx] <- rgamma(nrow(ones_idx),
+                                shape = gamma_shape[ones_ko],
+                                rate  = gamma_rate[ones_ko])
+
+  # (b) Construcció de grafs + precàlcul (compartit per les 3 configuracions)
+  precomp <- build_precomp(abund_sim)
+  if (length(precomp) < 2) { message("  Menys de 2 grafs; salta rèplica."); next }
+
+  # Carpeta pròpia d'aquesta rèplica
+  rep_dir <- file.path(OUT_DIR, sprintf("prova_%02d", rep))
+  dir.create(rep_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # (c) Un dendrograma per cada nombre d'iteracions
+  for (nom_cfg in names(ITER_CONFIGS)) {
+    cfg <- ITER_CONFIGS[[nom_cfg]]
+
+    # Resolem "max_diam" a un enter concret per poder-lo mostrar al títol
+    n_iter <- if (identical(cfg, "max_diam"))
+      max(vapply(precomp, function(x) x$diam, numeric(1))) else cfg
+
+    M_sim <- kernel_matrix(precomp, n_iter)
+
+    D  <- as.dist(1 - M_sim)
+    hc <- hclust(D, method = CLUST_METHOD)
+    saveRDS(hc, file.path(rep_dir, sprintf("hc_iter_%s.rds", nom_cfg)))
+
+    ids_rep <- rownames(M_sim)
+
+    # Dendrograma base amb etiquetes acolorides (independent de K_CUT)
+    dend <- as.dendrogram(hc)
+    ordre      <- order.dendrogram(dend)
+    ids_ordre  <- ids_rep[ordre]
+    grups_ord  <- etiqueta[match(ids_ordre, names(etiqueta))]
+    cols_ordre <- unname(COLORS_GRUP[grups_ord])
+    cols_ordre[is.na(cols_ordre)] <- "black"
+
+    labels(dend)        <- unname(etiqueta_curta[ids_ordre])
+    labels_colors(dend) <- cols_ordre
+    labels_cex(dend)    <- 0.8
+
+    # Un dendrograma per cada nombre de clústers
+    for (kc in K_CUTS) {
+      assignacions[[nom_cfg]][[as.character(kc)]][ids_rep, rep] <- cutree(hc, k = kc)
+
+      png(file.path(rep_dir, sprintf("dendrograma_iter_%s_k%d.png", nom_cfg, kc)),
+          width = 11, height = 7, units = "in", res = 150)
+      par(mar = c(10, 4, 4, 2))
+      plot(dend,
+           main = sprintf("Rèplica %d — %d iteracions — k=%d",
+                          rep, n_iter, kc),
+           ylab = "Distància (1 - similitud)")
+      rect.dendrogram(dend, k = kc, border = "grey40", lty = 2)
+      legend("topright", legend = names(COLORS_GRUP), fill = COLORS_GRUP,
+             cex = 0.7, bty = "n", ncol = 2)
+      dev.off()
+    }
+
+    message("  ", nom_cfg, " → ", n_iter, " iteracions")
+  }
+}
+```
+
+```{r calcul_distancies}
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. DISTÀNCIES ENTRE DENDROGRAMES (Robinson-Foulds i nodal)
+# ─────────────────────────────────────────────────────────────────────────────
+# Comparem, per a cada configuració d'iteracions, els 30 arbres de les rèpliques
+# entre si. Per a cada mètrica reportem la mitjana i la desviació de totes les
+# parelles (i, j), que quantifica com d'estables són els arbres entre rèpliques.
+
+# ── Helper: llegeix els hc desats i els converteix en arbres filogenètics ────
+carrega_arbres <- function(nom_cfg) {
+  arbres <- vector("list", N_REP)
+  for (rep in seq_len(N_REP)) {
+    f <- file.path(OUT_DIR, sprintf("prova_%02d", rep),
+                   sprintf("hc_iter_%s.rds", nom_cfg))
+    if (!file.exists(f)) next
+    hc <- readRDS(f)
+    arbres[[rep]] <- as.phylo(hc)   # les alçades de fusió → longituds de branca
+  }
+  arbres
+}
+
+# ── Helper: distància nodal amb longituds de branca reals (via cophenetic) ───
+# Diferència entre les matrius de distàncies fulla-a-fulla dels dos arbres.
+# Retornem la norma L2 del vector de diferències (parelles de fulles).
+nodal_dist_bl <- function(t1, t2) {
+  fulles <- sort(intersect(t1$tip.label, t2$tip.label))
+  C1 <- cophenetic(t1)[fulles, fulles]
+  C2 <- cophenetic(t2)[fulles, fulles]
+  ut <- upper.tri(C1)                      # cada parella de fulles un cop
+  sqrt(sum((C1[ut] - C2[ut])^2))
+}
+
+# ── Helper: totes les distàncies parella-a-parella per una llista d'arbres ───
+distancies_parelles <- function(arbres) {
+  ok  <- which(!vapply(arbres, is.null, logical(1)))
+  n   <- length(ok)
+  res <- data.frame()
+  for (a in seq_len(n - 1)) for (b in (a + 1):n) {
+    i <- ok[a]; j <- ok[b]
+    ti <- arbres[[i]]; tj <- arbres[[j]]
+    res <- rbind(res, data.frame(
+      rep_i   = i,
+      rep_j   = j,
+      RF      = RF.dist(ti, tj, normalize = TRUE),   # topològica, normalitzada
+      wRF     = wRF.dist(ti, tj, normalize = TRUE),  # amb pesos (longitud branca)
+      path    = path.dist(ti, tj),                   # path difference (topològica)
+      nodal   = nodal_dist_bl(ti, tj)                # nodal amb longituds de branca
+    ))
+  }
+  res
+}
+
+# ── PASSADA 1: recollir totes les distàncies de totes les configuracions ─────
+dist_per_cfg <- list()
+for (nom_cfg in names(ITER_CONFIGS)) {
+  arbres <- carrega_arbres(nom_cfg)
+  if (sum(!vapply(arbres, is.null, logical(1))) < 2) {
+    message("Config ", nom_cfg, ": menys de 2 arbres; salta.")
+    next
+  }
+  dist_per_cfg[[nom_cfg]] <- distancies_parelles(arbres)
+}
+
+# ── Màxim empíric global per a path i nodal (evitant divisió per zero) ────────
+tots      <- do.call(rbind, dist_per_cfg)
+max_path  <- max(tots$path,  na.rm = TRUE)
+max_nodal <- max(tots$nodal, na.rm = TRUE)
+if (!is.finite(max_path)  || max_path  == 0) max_path  <- 1
+if (!is.finite(max_nodal) || max_nodal == 0) max_nodal <- 1
+
+message(sprintf("Màxim empíric global — path = %.4f | nodal = %.4f",
+                max_path, max_nodal))
+
+# ── PASSADA 2: normalitzar, escriure CSVs i construir el resum ───────────────
+resum_dist <- data.frame()
+for (nom_cfg in names(dist_per_cfg)) {
+  d <- dist_per_cfg[[nom_cfg]]
+
+  # Normalització empírica global (path i nodal queden entre 0 i 1)
+  d$path  <- d$path  / max_path
+  d$nodal <- d$nodal / max_nodal
+
+  write.csv(d, file.path(OUT_DIR, sprintf("distancies_parelles_iter_%s.csv", nom_cfg)),
+            row.names = FALSE)
+
+  resum <- data.frame(
+    config  = nom_cfg,
+    metrica = c("RF", "wRF", "nodal", "w_nodal"),
+    mitjana = c(mean(d$RF), mean(d$wRF), mean(d$path), mean(d$nodal)),
+    sd      = c(sd(d$RF),   sd(d$wRF),   sd(d$path),   sd(d$nodal))
+  )
+  resum_dist <- rbind(resum_dist, resum)
+
+  message("\n── Distàncies entre rèpliques — iteracions = ", nom_cfg, " ──")
+  for (k in seq_len(nrow(resum))) {
+    message(sprintf("  %-6s: mitjana = %.4f | sd = %.4f",
+                    resum$metrica[k], resum$mitjana[k], resum$sd[k]))
+  }
+}
+write.csv(resum_dist, file.path(OUT_DIR, "resum_distancies.csv"), row.names = FALSE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(ape)
+  library(phangorn)
+})
+
+BASE_DIR <- "Dendogrames_KW"
+K        <- 4      # nombre de clústers
+N_REP    <- 30
+
+# ── Funció: talla un hclust en K clústers i retorna el conjunt de particions ──
+# Representem cada clúster com el conjunt ordenat d'etiquetes de les seves fulles,
+# codificat com una cadena, per poder fer diferència simètrica de conjunts.
+clusters_com_a_conjunt <- function(hc, k) {
+  cl <- cutree(hc, k = k)
+  # per cada clúster, les fulles que conté, ordenades i concatenades
+  parts <- tapply(names(cl), cl, function(x) paste(sort(x), collapse = "|"))
+  unique(as.character(parts))
+}
+
+# ── Diferència simètrica entre dos conjunts de clústers ──────────────────────
+dif_simetrica <- function(A, B) {
+  length(setdiff(A, B)) + length(setdiff(B, A))
+}
+
+# ── Arbre de referència: prova_uniforme, tallat en K clústers ────────────────
+hc_ref   <- readRDS(file.path(BASE_DIR, "prova_uniforme", "hc_uniforme.rds"))
+clus_ref <- clusters_com_a_conjunt(hc_ref, K)
+
+# ── Recorrem les 30 proves i les 3 configuracions ────────────────────────────
+configs <- c("1", "5", "max_diam")
+
+resultats <- data.frame()
+
+for (rep in seq_len(N_REP)) {
+  rep_dir <- file.path(BASE_DIR, sprintf("prova_%02d", rep))
+  for (cfg in configs) {
+    f <- file.path(rep_dir, sprintf("hc_iter_%s.rds", cfg))
+    if (!file.exists(f)) {
+      warning("No existeix: ", f); next
+    }
+    hc   <- readRDS(f)
+    clus <- clusters_com_a_conjunt(hc, K)
+    d    <- dif_simetrica(clus_ref, clus)
+    resultats <- rbind(resultats,
+                       data.frame(prova = rep, config = cfg, dif_sim = d))
+  }
+}
+
+
+# ── Gràfica amb jitter horitzontal per evitar solapaments ────────────────────
+cols_cfg   <- c("1" = "blue", "5" = "green3", "max_diam" = "gold")
+offset_cfg <- c("1" = -0.15, "5" = 0, "max_diam" = 0.15)   # desplaçament en X
+
+png(file.path(BASE_DIR, "diferencia_simetrica.png"),
+    width = 11, height = 6, units = "in", res = 150)
+
+plot(NA, xlim = c(0.5, N_REP + 0.5), ylim = c(0, 2 * K + 1.5),
+     xlab = "Nombre de l'experiment", ylab = "Diferència simètrica",
+     main = sprintf("Diferència simètrica amb l'arbre de referència (k = %d)", K),
+     xaxt = "n")
+axis(1, at = 1:N_REP)
+abline(h = seq(0, 2 * K, by = 2), col = "grey90", lty = 3)
+
+for (cfg in configs) {
+  sub <- resultats[resultats$config == cfg, ]
+  points(sub$prova + offset_cfg[cfg], sub$dif_sim,
+         col = cols_cfg[cfg], pch = 19, cex = 1.2)
+}
+
+legend("topright",
+       legend = c("1 iteració", "5 iteracions", "màxim diàmetre"),
+       col = cols_cfg, pch = 19, bty = "n")
+
+dev.off()
+
+# ── Desem també la taula ─────────────────────────────────────────────────────
+write.csv(resultats, file.path(BASE_DIR, "diferencia_simetrica.csv"),
+          row.names = FALSE)
+
+message("Fet. Gràfica i taula desades a '", BASE_DIR, "/'")
+```

@@ -1,0 +1,529 @@
+---
+title: "Kernel de transició"
+format: html
+editor: visual
+---
+
+```{r}
+library(Matrix)
+library(igraph)
+
+matriu_propagacio <- function(G){
+
+  T <- as_adjacency_matrix(G, sparse = TRUE)
+
+  abundancies <- as.numeric(V(G)$abundance)
+
+  # Pes de cada aresta A -> B proporcional a abundance(B)
+  # Multipliquem cada columna B de T per abundance(B)
+  T_pond <- T %*% Matrix::Diagonal(x = abundancies)
+
+  # Sumatori d'abundàncies dels destins possibles des de cada node (per files)
+  suma_files <- Matrix::rowSums(T_pond)
+
+  # Nodes sense destins (files a zero): es queden a ells mateixos
+  d <- ifelse(suma_files == 0, 1, 0)
+  suma_files[suma_files == 0] <- 1
+
+  D_inv <- Matrix::Diagonal(x = 1/suma_files)
+  D_d   <- Matrix::Diagonal(x = d)
+
+  T_prop <- (D_inv %*% T_pond) + D_d
+
+  return(t(T_prop))
+}
+```
+
+```{r}
+library(igraph)
+
+maj_comp_con <- function(g, mode = "weak") {
+  comp <- components(g, mode = mode)
+  idx  <- which.max(comp$csize)
+  comp_final <- induced_subgraph(g, which(comp$membership == idx))
+  return(comp_final)
+}
+```
+
+```{r}
+library(Matrix)
+library(lsa)
+
+Prop_att_ker <- function(G1, G2, iteracions, calc_maj_comp = FALSE,
+                         MP1 = NULL, MP2 = NULL){
+
+  if (calc_maj_comp){
+    G1 <- maj_comp_con(G1)
+    G2 <- maj_comp_con(G2)
+  }
+
+  if (iteracions == FALSE){
+    a <- diameter(G1, directed = TRUE, unconnected = TRUE)
+    b <- diameter(G2, directed = TRUE, unconnected = TRUE)
+    iteracions <- max(a,b)
+  }
+
+  etiquetes_1 <- V(G1)$name
+  etiquetes_2 <- V(G2)$name
+  conjunt_etiquetes <- unique(c(etiquetes_1,etiquetes_2))
+
+  pesos_1 <- as.numeric(V(G1)$abundance)
+  pesos_2 <- as.numeric(V(G2)$abundance)
+
+  idx1 <- match(etiquetes_1, conjunt_etiquetes)
+  idx2 <- match(etiquetes_2, conjunt_etiquetes)
+
+  p1 <- numeric(length(conjunt_etiquetes))
+  p2 <- numeric(length(conjunt_etiquetes))
+  p1[idx1] <- pesos_1
+  p2[idx2] <- pesos_2
+
+  if (is.null(MP1)) MP1 <- matriu_propagacio(G1)
+  if (is.null(MP2)) MP2 <- matriu_propagacio(G2)
+
+  sim = cosine(p1,p2)
+
+  if (iteracions > 1){
+    for (i in 2:iteracions){
+      pesos_1 <- as.numeric(MP1 %*% pesos_1)
+      pesos_2 <- as.numeric(MP2 %*% pesos_2)
+
+      p1[idx1] <- pesos_1
+      p2[idx2] <- pesos_2
+
+      sim <- sim + cosine(p1,p2)
+    }
+  }
+
+  return(sim)
+}
+```
+
+```{r}
+library(igraph)
+library(Matrix)
+library(lsa)
+
+# ── Càrrega dels grafs des dels fitxers .graphml ─────────────────────────────
+fitxers <- list.files("Benja", pattern = "\\.graphml$", full.names = TRUE)
+# Reconstruïm les IDs de pacient a partir del nom del fitxer
+# (treiem el sufix "_metabolic_graph.graphml" que va afegir el codi de lectura)
+patient_ids <- sub("_metabolic_graph\\.graphml$", "", basename(fitxers))
+# Llegim cada graf i anomenam la llista amb les IDs
+graphs <- lapply(fitxers, read_graph, format = "graphml")
+names(graphs) <- patient_ids
+message(length(graphs), " grafs carregats des de 'graphml_output/'")
+
+# ── 0. Preparació ────────────────────────────────────────────────────────────
+patient_ids <- names(graphs)
+n           <- length(graphs)
+
+# ── 1. Pre-càlcul: component connexa principal + matriu de propagació ─────────
+# Per a cada pacient guardam el graf reduït a la seva major component connexa,
+# la seva matriu de propagació i el seu diàmetre, per no recalcular-los al bucle.
+precomp <- lapply(graphs, function(g) {
+  g_comp <- maj_comp_con(g)              # major component connexa
+  list(
+    graf = g_comp,
+    MP   = matriu_propagacio(g_comp),    # matriu de propagació d'aquesta component
+    diam = diameter(g_comp, directed = TRUE, unconnected = TRUE)  # diàmetre
+  )
+})
+names(precomp) <- patient_ids
+
+
+max_diam <- max(vapply(precomp, function(x) x$diam, numeric(1)))
+message("Nombre d'iteracions fix (màxim diàmetre): ", max_diam)
+
+# ── 2. Matriu de similitud crua (diagonal + triangle superior) ───────────────
+M <- matrix(0, n, n)
+rownames(M) <- patient_ids
+colnames(M) <- patient_ids
+
+for (i in 1:n) {
+  for (j in i:n) {
+    val <- Prop_att_ker(
+      G1            = precomp[[i]]$graf,
+      G2            = precomp[[j]]$graf,
+      iteracions    = 1,         # nombre d'iteracions FIX per a tothom
+      calc_maj_comp = FALSE,            # ja l'hem calculada al precàlcul
+      MP1           = precomp[[i]]$MP,  # matriu de propagació precalculada
+      MP2           = precomp[[j]]$MP
+    )
+    M[i, j] <- val
+    M[j, i] <- val                      # simetria: A vs B = B vs A
+  }
+}
+
+# ── 3. Normalització del kernel ──────────────────────────────────────────────
+# M_sim(i,j) = M(i,j) / sqrt( M(i,i) * M(j,j) )
+arrels_diag  <- sqrt(diag(M))
+denominadors <- outer(arrels_diag, arrels_diag, FUN = "*")
+M_sim        <- M / denominadors
+
+```
+
+```{r}
+library(pheatmap)
+
+# ── 1. DATA FRAME D'ANOTACIÓ ─────────────────────────────────────────────────
+# Extraiem la primera lletra de cada ID de pacient com a etiqueta de grup.
+# El data frame ha de tenir els mateixos noms de fila que la matriu (rownames),
+# perquè pheatmap pugui aparellar cada pacient amb el seu grup.
+grup <- substr(rownames(M_sim), 1, 1)
+
+anotacio_df <- data.frame(
+  Grup      = factor(grup, levels = c("I", "A", "E")),
+  row.names = rownames(M_sim)
+)
+
+# ── 2. COLORS DE L'ANOTACIÓ ──────────────────────────────────────────────────
+# La clau de la llista ("Grup") ha de coincidir EXACTAMENT amb el nom de la
+# columna del data frame d'anotació.
+colors_anotacio <- list(
+  Grup = c(
+    I = "skyblue",   # IDs que comencen per I → celest
+    A = "#4DAF4A",   # IDs que comencen per A → verd estètic
+    E = "purple"     # IDs que comencen per E → morat
+  )
+)
+
+
+# ── 3. ESCALA DE COLOR AJUSTADA AL RANG REAL ─────────────────────────────────
+paleta <- colorRampPalette(c("white", "steelblue", "darkblue"))(100)
+rang   <- range(M_sim[lower.tri(M_sim)])
+talls  <- seq(rang[1], rang[2], length.out = 101)
+
+# Etiquetes de llegenda dins del rang real (no de 0 a 1)
+llegenda_vals <- round(seq(rang[1], rang[2], length.out = 5), 2)
+
+# ── 4. HEATMAP ───────────────────────────────────────────────────────────────
+pheatmap(
+  M_sim,
+  annotation_col    = anotacio_df,
+  annotation_row    = anotacio_df,
+  annotation_colors = colors_anotacio,
+  color  = paleta,
+  breaks = talls,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  legend        = TRUE,
+  legend_breaks = llegenda_vals,                  # dins el rang real
+  legend_labels = as.character(llegenda_vals),
+  main = "Similitud kernel de transició"
+)
+```
+
+```{r}
+png("heatmap_kernel_transicio.png", width = 10, height = 9, units = "in", res = 300)
+
+pheatmap(
+  M_sim,
+  annotation_col    = anotacio_df,
+  annotation_row    = anotacio_df,
+  annotation_colors = colors_anotacio,
+  color  = paleta,
+  breaks = talls,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  legend = TRUE,
+  legend_breaks = llegenda_vals,
+  legend_labels = as.character(llegenda_vals),
+  main = "Similitud kernel de transició"
+)
+
+dev.off()   # imprescindible: tanca el fitxer i el desa
+```
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+grup <- substr(rownames(M_sim), 1, 1)
+
+# Colors de grup
+cols_grup <- c(I = "skyblue", A = "#4DAF4A", E = "purple")
+
+# Anotacions superior i lateral
+ha_col <- HeatmapAnnotation(Grup = grup, col = list(Grup = cols_grup),
+                            show_legend = FALSE)
+ha_row <- rowAnnotation(Grup = grup, col = list(Grup = cols_grup))
+
+# Escala de color ancorada al rang real
+rang    <- range(M_sim[lower.tri(M_sim, diag = TRUE)])
+col_fun <- colorRamp2(seq(rang[1], rang[2], length.out = 3),
+                      c("white", "steelblue", "darkblue"))
+
+ht <- Heatmap(
+  M_sim,
+  name            = "S",
+  col             = col_fun,
+  cluster_rows    = TRUE,
+  cluster_columns = TRUE,
+  show_row_names  = FALSE,
+  show_column_names = FALSE,
+  top_annotation  = ha_col,
+  left_annotation = ha_row,
+  column_title    = "Similitud kernel de transició",
+  heatmap_legend_param = list(
+    legend_height = unit(6, "cm"),     # estira la barra verticalment
+    title_position = "topcenter"
+  )
+)
+
+# 'center' centra la llegenda verticalment respecte al heatmap
+draw(ht,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     legend_grouping        = "original")
+
+png("heatmap_kernel_transicio.png", width = 10, height = 9, units = "in", res = 300)
+draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+```
+
+
+```{r}
+library(igraph)
+library(Matrix)
+library(lsa)
+library(ComplexHeatmap)
+library(circlize)
+
+# ── Funció: matriu de similitud normalitzada per a un nombre d'iteracions ────
+# Reutilitza el 'precomp' ja calculat (component principal + MP + diàmetre).
+calcula_M_sim <- function(precomp, iteracions) {
+  ids <- names(precomp); n <- length(ids)
+
+  # Resol "max_diam" al màxim dels diàmetres del conjunt
+  n_iter <- if (identical(iteracions, "max_diam"))
+    max(vapply(precomp, function(x) x$diam, numeric(1))) else iteracions
+
+  M <- matrix(0, n, n, dimnames = list(ids, ids))
+  for (i in 1:n) for (j in i:n) {
+    val <- Prop_att_ker(
+      G1 = precomp[[i]]$graf, G2 = precomp[[j]]$graf,
+      iteracions = n_iter, calc_maj_comp = FALSE,
+      MP1 = precomp[[i]]$MP, MP2 = precomp[[j]]$MP
+    )
+    M[i, j] <- val; M[j, i] <- val
+  }
+  arrels <- sqrt(diag(M))
+  M / outer(arrels, arrels)
+}
+
+# ── Funció: dibuixa i desa un heatmap ────────────────────────────────────────
+# mode = "ordenat"  → files/columnes ordenades per grup A, I, E (sense clustering)
+# mode = "kmeans"   → 3 clusters k-means que parteixen el heatmap; color = grup real
+dibuixa_heatmap <- function(M_sim, mode, titol, fitxer, k = 3, seed = 42) {
+  grup      <- substr(rownames(M_sim), 1, 1)
+  cols_grup <- c(I = "skyblue", A = "#4DAF4A", E = "purple")
+
+  ha_col <- HeatmapAnnotation(Grup = grup, col = list(Grup = cols_grup),
+                              show_legend = FALSE)
+  ha_row <- rowAnnotation(Grup = grup, col = list(Grup = cols_grup))
+
+  rang    <- range(M_sim[lower.tri(M_sim, diag = TRUE)])
+  col_fun <- colorRamp2(seq(rang[1], rang[2], length.out = 3),
+                        c("white", "steelblue", "darkblue"))
+
+  if (mode == "ordenat") {
+    # Ordre forçat A, I, E; sense clustering
+    ordre_grup <- factor(grup, levels = c("A", "I", "E"))
+    ord        <- order(ordre_grup)
+    M_ord      <- M_sim[ord, ord]
+    grup_ord   <- grup[ord]
+
+    ha_col <- HeatmapAnnotation(Grup = grup_ord, col = list(Grup = cols_grup),
+                                show_legend = FALSE)
+    ha_row <- rowAnnotation(Grup = grup_ord, col = list(Grup = cols_grup))
+
+    ht <- Heatmap(
+      M_ord, name = "S", col = col_fun,
+      cluster_rows = FALSE, cluster_columns = FALSE,
+      row_order = seq_len(nrow(M_ord)), column_order = seq_len(ncol(M_ord)),
+      show_row_names = FALSE, show_column_names = FALSE,
+      top_annotation = ha_col, left_annotation = ha_row,
+      column_title = titol,
+      heatmap_legend_param = list(legend_height = unit(6, "cm"),
+                                  title_position = "topcenter")
+    )
+
+  } else {  # mode == "kmeans"
+    set.seed(seed)                          # reproduïbilitat del k-means
+    km  <- kmeans(M_sim, centers = k)
+    cl  <- factor(paste0("C", km$cluster))  # etiqueta de clúster per partir
+
+    ht <- Heatmap(
+      M_sim, name = "S", col = col_fun,
+      row_split = cl, column_split = cl,     # 3 blocs segons k-means
+      cluster_row_slices = FALSE, cluster_column_slices = FALSE,
+      show_row_names = FALSE, show_column_names = FALSE,
+      top_annotation = ha_col, left_annotation = ha_row,  # color = grup real
+      column_title = titol,
+      heatmap_legend_param = list(legend_height = unit(6, "cm"),
+                                  title_position = "topcenter")
+    )
+  }
+
+  draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+  png(fitxer, width = 10, height = 9, units = "in", res = 300)
+  draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+  dev.off()
+  message("Desat → ", fitxer)
+}
+
+# ── Càlcul de les dues matrius de similitud ──────────────────────────────────
+M_maxdiam <- calcula_M_sim(precomp, "max_diam")
+M_iter5   <- calcula_M_sim(precomp, 5)
+
+# ── Els quatre heatmaps ──────────────────────────────────────────────────────
+# 1. Ordenat per grup — max_diam
+dibuixa_heatmap(M_maxdiam, "ordenat",
+                "Similitud kernel — ordenat per grup (max_diam)",
+                "heatmap_ordenat_maxdiam.png")
+
+# 2. Ordenat per grup — 5 iteracions
+dibuixa_heatmap(M_iter5, "ordenat",
+                "Similitud kernel — ordenat per grup (5 iteracions)",
+                "heatmap_ordenat_iter5.png")
+
+# 3. K-means 3 clusters — max_diam
+dibuixa_heatmap(M_maxdiam, "kmeans",
+                "Similitud kernel — k-means 3 clusters (max_diam)",
+                "heatmap_kmeans_maxdiam.png", k = 3)
+
+# 4. K-means 3 clusters — 5 iteracions
+dibuixa_heatmap(M_iter5, "kmeans",
+                "Similitud kernel — k-means 3 clusters (5 iteracions)",
+                "heatmap_kmeans_iter5.png", k = 3)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(lsa)
+  library(ComplexHeatmap)
+  library(circlize)
+})
+
+OUT_DIR_HM <- "Heatmaps_uniforme"
+dir.create(OUT_DIR_HM, showWarnings = FALSE)
+
+# ── Càrrega dels grafs i precomp amb abundàncies uniformes (tots els nodes = 1) ─
+fitxers     <- list.files("Benja", pattern = "\\.graphml$", full.names = TRUE)
+patient_ids <- sub("_metabolic_graph\\.graphml$", "", basename(fitxers))
+graphs      <- lapply(fitxers, read_graph, format = "graphml")
+names(graphs) <- patient_ids
+message(length(graphs), " grafs carregats des de 'Benja/'")
+
+precomp_u <- lapply(graphs, function(g) {
+  gc <- maj_comp_con(g)
+  V(gc)$abundance <- rep(1, vcount(gc))        # ← abundància 1 a cada node
+  list(graf = gc,
+       MP   = matriu_propagacio(gc),
+       diam = diameter(gc, directed = TRUE, unconnected = TRUE))
+})
+names(precomp_u) <- patient_ids
+
+# ── Matriu de similitud normalitzada per a un nombre d'iteracions ────────────
+calcula_M_sim <- function(precomp, iteracions) {
+  ids <- names(precomp); n <- length(ids)
+  n_iter <- if (identical(iteracions, "max_diam"))
+    max(vapply(precomp, function(x) x$diam, numeric(1))) else iteracions
+  M <- matrix(0, n, n, dimnames = list(ids, ids))
+  for (i in 1:n) for (j in i:n) {
+    val <- Prop_att_ker(precomp[[i]]$graf, precomp[[j]]$graf,
+                        iteracions = n_iter, calc_maj_comp = FALSE,
+                        MP1 = precomp[[i]]$MP, MP2 = precomp[[j]]$MP)
+    M[i, j] <- val; M[j, i] <- val
+  }
+  arrels <- sqrt(diag(M))
+  M / outer(arrels, arrels)
+}
+
+# ── Dibuixa i desa un heatmap ────────────────────────────────────────────────
+dibuixa_heatmap <- function(M_sim, mode, titol, fitxer, k = 3, seed = 42) {
+  cols_grup <- c(I = "skyblue", A = "#4DAF4A", E = "purple")
+
+  rang    <- range(M_sim[lower.tri(M_sim, diag = TRUE)])
+  col_fun <- colorRamp2(seq(rang[1], rang[2], length.out = 3),
+                        c("white", "steelblue", "darkblue"))
+
+  if (mode == "ordenat") {
+    grup       <- substr(rownames(M_sim), 1, 1)
+    ord        <- order(factor(grup, levels = c("A", "I", "E")))
+    M_sim      <- M_sim[ord, ord]
+    grup       <- grup[ord]
+
+    ha_col <- HeatmapAnnotation(Grup = grup, col = list(Grup = cols_grup),
+                                show_legend = FALSE)
+    ha_row <- rowAnnotation(Grup = grup, col = list(Grup = cols_grup))
+
+    ht <- Heatmap(
+      M_sim, name = "S", col = col_fun,
+      cluster_rows = FALSE, cluster_columns = FALSE,
+      row_order = seq_len(nrow(M_sim)), column_order = seq_len(ncol(M_sim)),
+      show_row_names = FALSE, show_column_names = FALSE,
+      top_annotation = ha_col, left_annotation = ha_row,
+      column_title = titol,
+      heatmap_legend_param = list(legend_height = unit(6, "cm"),
+                                  title_position = "topcenter")
+    )
+
+  } else {  # kmeans
+    grup <- substr(rownames(M_sim), 1, 1)
+    ha_col <- HeatmapAnnotation(Grup = grup, col = list(Grup = cols_grup),
+                                show_legend = FALSE)
+    ha_row <- rowAnnotation(Grup = grup, col = list(Grup = cols_grup))
+
+    set.seed(seed)
+    km <- kmeans(M_sim, centers = k)
+    cl <- factor(paste0("C", km$cluster))
+
+    ht <- Heatmap(
+      M_sim, name = "S", col = col_fun,
+      row_split = cl, column_split = cl,
+      cluster_row_slices = FALSE, cluster_column_slices = FALSE,
+      show_row_names = FALSE, show_column_names = FALSE,
+      top_annotation = ha_col, left_annotation = ha_row,
+      column_title = titol,
+      heatmap_legend_param = list(legend_height = unit(6, "cm"),
+                                  title_position = "topcenter")
+    )
+  }
+
+  png(file.path(OUT_DIR_HM, fitxer), width = 10, height = 9, units = "in", res = 300)
+  draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+  dev.off()
+  message("Desat → ", file.path(OUT_DIR_HM, fitxer))
+}
+
+# ── Matrius de similitud (abundàncies = 1) ───────────────────────────────────
+M_maxdiam <- calcula_M_sim(precomp_u, "max_diam")
+M_iter5   <- calcula_M_sim(precomp_u, 5)
+
+# ── Els quatre heatmaps ──────────────────────────────────────────────────────
+dibuixa_heatmap(M_maxdiam, "ordenat",
+                "Abundàncies = 1 — ordenat per grup (max_diam)",
+                "heatmap_unif_ordenat_maxdiam.png")
+
+dibuixa_heatmap(M_iter5, "ordenat",
+                "Abundàncies = 1 — ordenat per grup (5 iteracions)",
+                "heatmap_unif_ordenat_iter5.png")
+
+dibuixa_heatmap(M_maxdiam, "kmeans",
+                "Abundàncies = 1 — k-means 3 clusters (max_diam)",
+                "heatmap_unif_kmeans_maxdiam.png", k = 3)
+
+dibuixa_heatmap(M_iter5, "kmeans",
+                "Abundàncies = 1 — k-means 3 clusters (5 iteracions)",
+                "heatmap_unif_kmeans_iter5.png", k = 3)
+```
+

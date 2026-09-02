@@ -1,0 +1,256 @@
+---
+title: "Construcció_K0s_web"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+
+
+dir.create("Regnes", showWarnings = FALSE)
+
+# Llegir el fitxer d'organismes
+info <- read_lines("Regnes/pupurriMiquel.txt") |>
+  str_split_fixed("-->", 2)
+
+orgs  <- str_trim(info[, 1])
+grups <- str_trim(info[, 2])
+
+# Descarregar els KO de cada organisme
+ko_list <- map(orgs, function(org) {
+  url <- paste0("https://rest.kegg.jp/link/ko/", org)
+  message("Descarregant: ", org)
+  dat <- read_tsv(url, col_names = c("gene", "ko"), show_col_types = FALSE)
+  dat$ko |>
+    str_remove("^ko:") |>
+    unique()
+})
+names(ko_list) <- orgs
+
+# Construir la matriu binària (files = KO, columnes = organismes)
+tots_ko <- sort(unique(unlist(ko_list)))
+
+M <- sapply(ko_list, function(k) as.integer(tots_ko %in% k))
+rownames(M) <- tots_ko
+colnames(M) <- orgs
+
+# Metadades
+metadata <- tibble(organisme = orgs, grup = grups)
+
+# Guardar dins de "regnes"
+write.csv(M, file.path("Regnes", "matriu_KO.csv"))
+write_csv(metadata, file.path("Regnes", "metadata.csv"))
+
+dim(M)
+```
+```{r}
+##  Generam una funció que construeix els "reaction graphs" per
+##  pacient a partir les abundància de KO's.
+
+
+suppressPackageStartupMessages({
+  library(igraph)
+  library(jsonlite)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+})
+
+
+ABUND_FILE   <- "Regnes/matriu_KO.csv" # ruta de la taula d'abundàncies
+KO_EC_FILE   <- "Dades_Pere/enzymes_KO.json" # ruta que relaciona K00 i enzims
+EC_RXN_FILE  <- "Dades_Pere/enzymes_lite_new.json" # ruta que relaciona reaccions i enzims
+RXN_FILE     <- "Dades_Pere/reactions_lite_pw.json" # ruta que ens dona informació sobre les reaccions
+OUT_DIR <- file.path("Regnes/grafs_pupurri")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+
+abund_raw <- read.csv(ABUND_FILE, row.names = 1, check.names = FALSE)
+# files = KOs, columnes = pacients
+
+ko_ec_raw  <- fromJSON(KO_EC_FILE,  simplifyVector = FALSE) # de KO a enzims
+ec_rxn_raw <- fromJSON(EC_RXN_FILE, simplifyVector = FALSE) # d'enzims a reaccions
+rxn_raw    <- fromJSON(RXN_FILE,    simplifyVector = FALSE) # informació de reaccions
+
+# Anomenam les llistes de forma explícita
+names(ec_rxn_raw) <- vapply(ec_rxn_raw, function(x) x$enzyme,   character(1))
+names(rxn_raw)    <- vapply(rxn_raw,    function(x) x$reaction, character(1))
+
+## CONSTRUCCIÓ DEL MAPEIG KO → REACCIONS
+
+# EC → IDs de reacció
+ec_to_rxns <- lapply(ec_rxn_raw, function(ec_entry) {
+  unique(unlist(ec_entry[["reaction"]]))  # nom del camp segons l'estructura del JSON
+})
+names(ec_to_rxns) <- vapply(ec_rxn_raw, function(x) x$enzyme, character(1))
+
+# KO → IDs de reacció (passant per l'EC com a intermediari)
+ko_to_rxns <- lapply(ko_ec_raw, function(ec_list) {
+  rxns <- unlist(lapply(unlist(ec_list), function(ec) ec_to_rxns[[ec]]))
+  unique(rxns[!is.null(rxns)]) # llevam duplicats i nuls
+})
+names(ko_to_rxns) <- names(ko_ec_raw)
+
+# Llevam els KOs que no es mapegen a cap reacció
+ko_to_rxns <- Filter(function(x) length(x) > 0, ko_to_rxns)
+
+
+rxn_meta <- tibble(
+  rxn_id     = vapply(rxn_raw, function(r) r[["reaction"]], character(1)),  # nom de la reacció
+  reversible = sapply(rxn_raw, function(r) isTRUE(r[["reversible"]])),      # TRUE si la reacció és reversible
+  substrates = lapply(rxn_raw, function(r) unique(unlist(r[["substrate"]]))), # substrats únics
+  products   = lapply(rxn_raw, function(r) unique(unlist(r[["product"]])))    # productes únics
+)
+
+
+reaction_graph_patient <- function(patient_id, abund_vec, ko_to_rxns, rxn_meta,
+                                   exclude_compounds = character(0)) {
+  
+  # Abundància proporcional per reacció
+  active_kos <- names(abund_vec)[abund_vec > 0] # només KOs presents (abundància > 0)
+  active_kos <- intersect(active_kos, names(ko_to_rxns)) # i que tenguin reaccions associades
+  
+  if (length(active_kos) == 0) { # si no hi ha cap KO actiu, sortim
+    message("  No active KOs found for patient: ", patient_id)
+    return(NULL)
+  }
+  
+  # Construïm un data frame: cada fila = (reacció, abundància fraccionada)
+  rxn_abund_long <- lapply(active_kos, function(ko) {
+    rxns <- ko_to_rxns[[ko]]
+    n    <- length(rxns)
+    # repartim l'abundància del KO entre totes les seves reaccions
+    tibble(rxn_id = rxns, frac_abund = abund_vec[[ko]] / n)
+  }) |>
+    bind_rows() |>
+    summarise(abundance = sum(frac_abund), .by = rxn_id) # sumam per reacció
+
+  # Mantenim només reaccions amb abundància > 0 i amb metadades conegudes
+  active_rxns <- rxn_abund_long |>
+    filter(abundance > 0) |>
+    inner_join(rxn_meta, by = "rxn_id") # afegim substrats/productes/reversibilitat
+  
+  if (nrow(active_rxns) == 0) { # si no queda cap reacció, sortim
+    message("  No active reactions for patient: ", patient_id)
+    return(NULL)
+  }
+  
+  # Per cada reacció reversible cream un node nou "_rev" amb la
+  # mateixa abundància, però amb substrats i productes intercanviats,
+  # de manera que el flux invers quedi modelat com un node propi.
+  rev_rxns <- active_rxns |>
+  filter(reversible) |>
+  mutate(
+    .subs_orig = substrates,        # còpia dels originals
+    .prod_orig = products
+  ) |>
+  transmute(
+    rxn_id     = paste0(rxn_id, "_rev"),
+    abundance  = abundance,
+    reversible = TRUE,
+    substrates = .prod_orig,        # substrats de la inversa = productes de la directa
+    products   = .subs_orig         # productes de la inversa = substrats de la directa
+  )
+  active_rxns <- bind_rows(active_rxns, rev_rxns)
+  
+  message("  Patient ", patient_id, ": ", nrow(active_rxns), " ordre del graf")
+  
+
+
+  # cada node té un únic sentit: produced = productes, consumed = substrats.
+  # Usam un índex compost → reaccions per trobar arestes R1→R2
+
+  
+  n_rxn    <- nrow(active_rxns)
+  produced <- active_rxns$products # compostos que produeix cada reacció
+  consumed <- active_rxns$substrates # compostos que consumeix cada reacció
+  
+  # Filtratge de compostos ubics (aigua, ATP, ADP, etc.): els llevam
+  # tant dels productes com dels substrats abans de construir l'índex,
+  # de manera que no generin arestes espúries.
+  if (length(exclude_compounds) > 0) {
+    produced <- lapply(produced, function(x) setdiff(x, exclude_compounds))
+    consumed <- lapply(consumed, function(x) setdiff(x, exclude_compounds))
+  }
+  
+  # Índex: compost → índexs de les reaccions que el CONSUMEIXEN
+  all_consumed_cpds <- unique(unlist(consumed))
+  cpd_to_consumer_idx <- setNames(
+    lapply(all_consumed_cpds, function(cpd) {
+      which(vapply(consumed, function(x) cpd %in% x, logical(1)))
+    }),
+    all_consumed_cpds
+  )
+  
+  # Per cada reacció R1, trobam totes les R2 que consumeixen algun compost que R1 produeix
+  edge_list <- lapply(seq_len(n_rxn), function(i) {
+    cpds_produced <- produced[[i]]
+    if (length(cpds_produced) == 0) return(NULL) # si no produeix res, no hi ha aresta
+    
+    # Unió de tots els consumidors dels compostos produïts, excloent-se a si mateixa
+    targets <- unique(unlist(cpd_to_consumer_idx[cpds_produced], use.names = FALSE))
+    targets <- targets[targets != i] # llevam els auto-bucles
+    
+    if (length(targets) == 0) return(NULL)
+    tibble(from = active_rxns$rxn_id[i],
+           to   = active_rxns$rxn_id[targets]) # aresta dirigida R1 → R2
+  }) |> bind_rows()
+  
+  # Construcció del graf amb igraph
+  nodes_df <- active_rxns |>
+    dplyr::select(rxn_id, abundance, reversible) |>
+    rename(name = rxn_id) # igraph espera que la columna de nodes es digui "name"
+  
+  if (nrow(edge_list) == 0) { # cas sense arestes: graf només amb nodes
+    g <- graph_from_data_frame(
+      d        = data.frame(from = character(0), to = character(0)),
+      directed = TRUE,
+      vertices = nodes_df
+    )
+  } else {
+    g <- graph_from_data_frame(
+      d        = edge_list,
+      directed = TRUE,
+      vertices = nodes_df
+    )
+  }
+  
+  # Atributs de grau dels nodes
+  V(g)$out_degree <- igraph::degree(g, mode = "out") # grau de sortida
+  V(g)$in_degree  <- igraph::degree(g, mode = "in")  # grau d'entrada
+  
+  graph_attr(g, "patient_id") <- patient_id # guardam l'id del pacient dins el graf
+  return(g)
+}
+
+
+patient_ids <- colnames(abund_raw) # cada columna és un pacient
+graphs      <- list()
+
+
+exclude_cpds <- c("C00001", "C00002", "C00008","C00006", "C00005", "C00003", "C00004", "C00010", "C00022", "C00024", "C00025", "C00009")
+
+for (pid in patient_ids) {
+  message("Processing: ", pid)
+  abund_vec <- setNames(abund_raw[[pid]], rownames(abund_raw)) # vector abundància amb noms de KO
+  
+  g <- reaction_graph_patient(
+    patient_id        = pid,
+    abund_vec         = abund_vec,
+    ko_to_rxns        = ko_to_rxns,
+    rxn_meta          = rxn_meta,
+    exclude_compounds = exclude_cpds
+  )
+  
+  if (!is.null(g)) {
+    graphs[[pid]] <- g
+    out_path <- file.path(OUT_DIR, paste0(pid, "_metabolic_graph.graphml"))
+    write_graph(g, out_path, format = "graphml") # exportam a GraphML
+    message("  Saved → ", out_path)
+  }
+}
+
+message("\nDone. ", length(graphs), " graphs exported to '", OUT_DIR, "/'")
+```
