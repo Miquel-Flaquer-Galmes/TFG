@@ -44,7 +44,7 @@ A partir d'una matriu de KOs (files = KOs, columnes = mostres) el flux és:
 
 Els grafs de reaccions de totes les mostres, en format `.graphml`, estan disponibles en línia (fitxers massa voluminosos per al repositori):
 
-**Enllaç a Drive:** <!-- enganxa aquí el link al Drive -->
+**Enllaç a Drive:** (https://drive.google.com/drive/folders/1UTT0xBHlQ-aPiDn_2mDtLfrqzlHIwQzo?usp=sharing)
 
 ### Resultats
 
