@@ -6,7 +6,7 @@ L'anàlisi s'aplica a tres cohorts independents:
 
 | Cohort | Grups | Matriu d'abundància | Metadades |
 |--------|-------|---------------------|-----------|
-| Grups d'edat | Adults / Infants / Elders | `MTG_abund.tsv` | (deduïdes de l'ID de mostra) |
+| Grups d'edat | Adults / Infants / Elders | `GutMicrobiota.tsv` | (deduïdes de l'ID de mostra) |
 | Dietes | Korean / Western | `KoreanWestern.csv` | `Results.csv` |
 | Regnes taxonòmics | Animal, Planta, Fong, Arqueu, Bacteri… | `matriu_KO.csv` | `metadata.csv` |
 
@@ -50,12 +50,11 @@ Els grafs de reaccions de totes les mostres, en format `.graphml`, estan disponi
 
 | Carpeta / fitxer | Contingut |
 |------------------|-----------|
-| `Benja/dendrogrames/` | Dendrogrames circulars del kernel de transició per grups d'edat (5 iteracions i max_diam × Adults/Infants/Elders). |
+| `GutMicrobiota/dendrogrames/` | Dendrogrames circulars del kernel de transició per grups d'edat (5 iteracions i max_diam × Adults/Infants/Elders). |
 | `Dendogrames_KW/` | Dendrogrames de la cohort de dietes: 30 rèpliques × 3 configuracions d'iteracions, distàncies entre arbres i diferència simètrica. |
 | `Dendogrames_regnes/` | El mateix per a la cohort de regnes taxonòmics. |
-| `Heatmaps_uniforme/` | Heatmaps de similitud amb abundàncies de node = 1 (presència/absència pura). |
-| `heatmap_{ordenat,kmeans}_{iter5,maxdiam}.png` | Heatmaps de similitud amb abundàncies reals (cohort d'edat). |
-| `Papers/` | Bibliografia de referència del TFG. |
+| `Heatmaps/` | Heatmaps de similitud |
+
 
 ## El kernel de propagació
 
@@ -88,4 +87,4 @@ L'ordre habitual d'execució és:
 2. Construir els grafs metabòlics amb `Lectura_dades_possibilitat_excloure.qmd`.
 3. Executar l'anàlisi desitjada: cadena de Markov (`Cadena_Markov_unificat.qmd`) o comparació entre mostres (`kernel_transicio.qmd`, `kernel_trans_Benja.qmd`, `dendrograma_KW.qmd`, `dendrograma_regnes.qmd`).
 
-> **Nota sobre rutes.** Els scripts fan referència a rutes com `Mostres/`, `Regnes/` i `Dades_Pere/`. Segons on hagis desat els fitxers d'entrada d'aquest repositori (`Dades/`, `Diccionaris/`), ajusta les variables de ruta del principi de cada `.qmd` (`ABUND_FILE`, `META_FILE`, `KO_EC_FILE`, `EC_RXN_FILE`, `RXN_FILE`) perquè apuntin a les carpetes correctes.
+> **Nota sobre rutes.** Els scripts fan referència a rutes com `Mostres/`, `Regnes/` i `Dades_Pere/`. Segons on hagis desat els fitxers d'entrada d'aquest repositori (`Dades/`, `Diccionaris/`), ajusta les variables de ruta i nom del principi de cada `.qmd` (`ABUND_FILE`, `META_FILE`, `KO_EC_FILE`, `EC_RXN_FILE`, `RXN_FILE`) perquè apuntin a les carpetes correctes.
